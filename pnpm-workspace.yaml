@@ -1,0 +1,7 @@
+# pnpm settings live here since pnpm 10 (they are no longer read from .npmrc).
+#
+# A hoisted, npm-style node_modules keeps the local Windows run and the Linux CI
+# run on the same plain-directory layout: this machine's directory junctions are
+# reported back as their own path, so Node's ESM resolver cannot walk into the
+# isolated .pnpm store to find sibling dependencies.
+nodeLinker: hoisted

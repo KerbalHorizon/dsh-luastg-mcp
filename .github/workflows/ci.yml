@@ -1,0 +1,39 @@
+# Minimal CI: build lib/ from src/ and run the full test suite.
+#
+# The suite needs the two DSH runtime packages (they are devDependencies), which
+# is why `pnpm install` runs before `npm test`: with them installed all 57 tests
+# run, without them the 31 tool-contract tests skip themselves. No LuaSTG editor
+# is required — test/mock-bridge.mjs speaks the same protocol in memory.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Run tests
+        run: npm test

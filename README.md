@@ -1,6 +1,8 @@
 # dsh-luastg-mcp
 
-**v1.0.0** · 5 个核心工具 · TCP NDJSON 传输 · 需要 DSH `0.2.0-rc.2`、Node `>= 24`
+**v1.0.0** · 5 个核心工具 · TCP NDJSON 传输 · 需要 DSH `0.2.0-rc.2`、Node `>= 22.13`
+
+[![CI](https://github.com/KerbalHorizon/dsh-luastg-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/KerbalHorizon/dsh-luastg-mcp/actions/workflows/ci.yml)
 
 DSH（DeepSeek Harness）插件：通过 TCP 连接 **LuaSTG Editor Sharp X** 进程内的
 `LuaSTGMcpBridge`，把编辑器**当前打开**的 `.lstges` 工程节点树暴露给模型，并让模型
@@ -316,7 +318,7 @@ luastg_update_node: unknown_attribute: node '0' (...) has no attribute 'Missing'
    `MCP bridge ready on 127.0.0.1:8090.`。
 2. **编辑器里打开了一个 `.lstges` 工程**：没有活动文档时桥接返回 `no_document`
    （只开启动页不算）。
-3. **DSH `0.2.0-rc.2`**（`>=0.2.0-rc.2 <0.3.0`）、**Node `>= 24`**。
+3. **DSH `0.2.0-rc.2`**（`>=0.2.0-rc.2 <0.3.0`）、**Node `>= 22.13`**。
 
 ### 4.2 装进当前桌面端 profile
 
@@ -464,6 +466,9 @@ luastg_get_nodes: LuaSTG 编辑器 MCP 桥接在 5000 ms 内未响应（127.0.0.
 ```powershell
 cd D:\DSHProgramme\dsh-luastg-mcp
 
+# 0. 安装开发依赖（@deepseek-ai/dsh-tools + schemastery，用于工具契约测试）
+pnpm install
+
 # 1. 构建 lib/
 node scripts/build.mjs
 
@@ -471,10 +476,19 @@ node scripts/build.mjs
 node --import ./test/setup.mjs scripts/check.mjs
 
 # 3. 全部测试（TCP 客户端、路径归一化、工具报文、mock 桥接）
-node --import ./test/setup.mjs --test --test-isolation=none "test/*.test.mjs"
+node --import ./test/setup.mjs test/all.mjs
 ```
 
 或直接 `npm test`（等价于 build + 全部测试）。
+
+`test/all.mjs` 在**单个进程**里按文件名顺序加载所有 `*.test.mjs`。这样 Node 22 与 24 行为一致
+（`--test-isolation` 只在 Node 23+ 存在），也不依赖子进程——在没有 fork 权限的沙箱里同样能跑。
+
+`test/setup.mjs` 按 `DSH_PACKAGES` → 仓库 `node_modules` → 全局 DSH 安装的顺序查找
+`@deepseek-ai/dsh-tools`；只有全局安装那种布局才需要 `test/dsh-resolver.mjs` 的 resolve hook，
+仓库内 `node_modules` 走 Node 原生解析。两者都找不到时，31 个工具契约测试会自动 skip（其余 26 个照常跑）。
+
+CI 在 Ubuntu + Node 22 上执行 `pnpm install && npm test`，安装到 devDependencies 后 57 个测试全量运行。
 
 测试**不需要真实编辑器**：`test/mock-bridge.mjs` 用 `node:net` 实现了一个同协议的内存树，
 支持 `ping` / `get_tree` / `insert_node` / `set_attribute` / `delete_node`，并会模拟路径左移。
@@ -555,7 +569,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File `
 | 组件 | 版本要求 |
 |---|---|
 | DSH | `>=0.2.0-rc.2 <0.3.0` |
-| Node | `>= 24` |
+| Node | `>= 22.13`（CI 用 22） |
 | LuaSTG Editor Sharp X | 桥接编译自 `LuaSTGEditorSharp.sln`（实测 0.78.4.0） |
 | 桥接协议 | v1（`docs/bridge-protocol.md`） |
 

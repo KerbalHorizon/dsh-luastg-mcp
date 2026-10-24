@@ -10,3 +10,9 @@ backups/
 
 # npm pack 产物
 *.tgz
+
+# pnpm 本地 store（CI 用默认位置，不会产生这个目录）
+.pnpm-store/
+
+# 临时下载的 Node 运行时（仅本地验证用）
+.node22*/
