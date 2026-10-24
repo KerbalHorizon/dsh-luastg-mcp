@@ -1,0 +1,12 @@
+node_modules/
+.dsh-test/
+*.log
+.DS_Store
+Thumbs.db
+test/.tmp/
+
+# 测试工程的本地备份，不随发行版分发
+backups/
+
+# npm pack 产物
+*.tgz

@@ -1,0 +1,32 @@
+# dsh-luastg-mcp bundle patch.
+#
+# The row names this same package, which pnpm installs into the profile's
+# node_modules. The plugin talks to the LuaSTG Editor Sharp X MCP bridge over
+# TCP (newline-delimited JSON) and registers five tools on ctx.tools:
+#   luastg_get_nodes      read the live node tree (path, optional maxDepth)
+#   luastg_update_node    update existing attributes through editor commands
+#   luastg_add_node       insert one node through InsertCommand
+#   luastg_delete_node    delete one subtree through DeleteCommand
+#   luastg_update_script  replace a node's Code attribute (set_attribute)
+#
+# Nothing is read from or written to a .lstges file in this layer. The editor
+# owns the document, the undo stack and the WPF refresh; the bridge exposes
+# them on 127.0.0.1:8090.
+#
+# Optional per-profile configuration (add to the profile's cordis.patch.yml,
+# which is applied after this bundle layer):
+#
+#   - id: luastg-mcp
+#     config:
+#       host: '127.0.0.1'
+#       port: 8090
+#       timeoutMs: 5000
+#       maxDepth: 0        # default for luastg_get_nodes; 0 = whole tree
+#
+# Every field is optional. Start the editor with the LuaSTGMcpBridge plugin
+# loaded; if port 8090 is not listening, every tool returns an actionable
+# "连接失败，请确保 LuaSTG 编辑器已启动并加载了 MCP 桥接插件" error.
+
+- insert:
+    - id: luastg-mcp
+      name: 'dsh-luastg-mcp'
