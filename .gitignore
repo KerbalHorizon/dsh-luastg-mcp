@@ -16,3 +16,6 @@ backups/
 
 # 临时下载的 Node 运行时（仅本地验证用）
 .node22*/
+
+# local screenshots used for visual review
+shots/
