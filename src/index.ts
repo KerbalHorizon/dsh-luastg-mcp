@@ -10,6 +10,11 @@
 // alias and normalized by `node-path.ts`.
 import Schema from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { BridgeClient, BridgeCommandError } from './bridge-client.js'
 import type { BridgeResponse } from './bridge-client.js'
 import { normalizeAttributeValues } from './attributes.js'
@@ -59,6 +64,12 @@ export const Config = Schema.object({
     .step(1)
     .default(0)
     .description('Default tree depth for luastg_get_nodes: 0 returns everything, 2-3 is a cheap structure scan.'),
+  captureFallback: Schema.boolean()
+    .default(true)
+    .description(
+      'When the bridge has no take_screenshot action (protocol v1), capture the editor window locally with ' +
+        'PowerShell instead of failing. Set false on hosts without a desktop session.',
+    ),
 })
 
 const POSITIONAL_PATH_NOTE =
@@ -112,6 +123,502 @@ function normalizeNodeType(raw: string): string {
   return type
 }
 
+/**
+ * The rule every tree-building tool repeats to the model.
+ *
+ * A human authoring a stage in the editor works with native nodes (TaskWait, CreateEnemy,
+ * SetVelocity, Repeat, If, ...): they are readable, editable in the property grid, and produce
+ * the same Lua. A wall of Code defeats the whole point of the editor, so the tools say so.
+ */
+const NATIVE_FIRST_NOTE =
+  'Prefer native editor nodes over General.Code: build the stage from TaskWait / CreateEnemy / CreateSimpleEnemy / ' +
+  'SetVelocity / TaskMoveTo / Repeat / If style nodes, and only fall back to a Code node for logic that no native ' +
+  'node can express (arbitrary math, table manipulation, engine calls without a node).'
+
+/** Upper bounds mirror the C# side so a bad tree is rejected before it reaches the editor. */
+const SUBTREE_MAX_DEPTH = 64
+const SUBTREE_MAX_NODES = 2000
+
+/**
+ * Validate and normalize a nested `{type, attributes, children}` tree for `apply_subtree`.
+ *
+ * Node types go through the same shorthand reduction as `luastg_add_node`, so callers can mix
+ * `.Task.TaskWait`, `Task.TaskWait` and `TaskWait`. Attribute values are coerced to the strings
+ * the editor stores. Anything malformed fails here with a readable message instead of after a
+ * half-built tree has already been inserted.
+ */
+function normalizeSubtree(raw: unknown, depth = 0, counter = { nodes: 0 }): Record<string, unknown> {
+  if (depth > SUBTREE_MAX_DEPTH) throw new Error(`tree is nested deeper than ${SUBTREE_MAX_DEPTH} levels`)
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('each tree node must be a JSON object such as {"type":"TaskWait","attributes":{"Time":"60"}}')
+  }
+
+  const node = raw as Record<string, unknown>
+  counter.nodes += 1
+  if (counter.nodes > SUBTREE_MAX_NODES) throw new Error(`tree has more than ${SUBTREE_MAX_NODES} nodes`)
+
+  const type = normalizeNodeType(text(node.type))
+  if (type === '') throw new Error('every tree node needs a "type", for example "TaskWait"')
+
+  const normalized: Record<string, unknown> = { type }
+
+  const attributes = normalizeAttributeValues(node.attributes, { required: false, label: 'attributes' })
+  if (Object.keys(attributes).length > 0) normalized.attributes = attributes
+
+  if (node.children !== undefined) {
+    if (!Array.isArray(node.children)) throw new Error(`"children" of "${type}" must be an array`)
+    normalized.children = node.children.map((child) => normalizeSubtree(child, depth + 1, counter))
+  }
+
+  return normalized
+}
+
+/** How a `luastg_apply_subtree` call reached the document. */
+type SubtreeStrategy = 'apply_subtree' | 'insert_node-dfs'
+
+/** Normalized result of building a subtree, whichever transport was used. */
+interface BuiltSubtree {
+  strategy: SubtreeStrategy
+  /** Nodes the call created (== nodes in the requested tree). */
+  created: number
+  /** Path of the subtree root. */
+  path: string
+  text: string
+  parentPath: string
+  nodeCount?: number
+}
+
+/** Number of nodes in a normalized `{type, attributes, children}` tree. */
+function countSubtreeNodes(tree: Record<string, unknown>): number {
+  const children = Array.isArray(tree.children) ? (tree.children as Record<string, unknown>[]) : []
+  let total = 1
+  for (const child of children) total += countSubtreeNodes(child)
+  return total
+}
+
+/**
+ * Build a subtree through repeated `insert_node` calls, depth-first.
+ *
+ * The bridge protocol v1 (docs/bridge-protocol.md) has no bulk subtree action:
+ * `get_tree` / `insert_node` / `set_attribute` / `delete_node` are the whole tree
+ * surface. This path therefore inserts the root first, appends each child to the
+ * path the bridge returned for its parent, and never guesses a path itself.
+ *
+ * Failure is rolled back the same way a refused bulk insert would leave nothing
+ * behind: one `delete_node` on the subtree root removes everything this call
+ * created. Paths are positional, so the root path stays valid for that delete
+ * even after the children were appended.
+ */
+async function buildSubtreeWithInsertNode(
+  client: BridgeClient,
+  parentPath: string,
+  tree: Record<string, unknown>,
+  options: { reveal: boolean; signal?: AbortSignal },
+): Promise<BuiltSubtree> {
+  const total = countSubtreeNodes(tree)
+  const paths: string[] = []
+  let rootText = ''
+  let nodeCount: number | undefined
+
+  const insert = async (spec: Record<string, unknown>, parent: string): Promise<string> => {
+    const payload: Record<string, unknown> = {
+      action: 'insert_node',
+      parent,
+      type: spec.type,
+      // Expanding ancestors + selecting the row on every insert would flash the
+      // tree; only the final node is revealed, and it expands the whole chain.
+      reveal: options.reveal && paths.length + 1 === total,
+    }
+    if (spec.attributes !== undefined) payload.attributes = spec.attributes
+
+    const response = await client.request(payload, options.signal)
+    const path = typeof response.path === 'string' ? response.path.trim() : ''
+    if (path === '') {
+      throw new Error(`the bridge inserted "${String(spec.type)}" but returned no path for the new node`)
+    }
+    if (paths.length === 0) rootText = typeof response.text === 'string' ? response.text : ''
+    paths.push(path)
+    if (typeof response.nodeCount === 'number') nodeCount = response.nodeCount
+    return path
+  }
+
+  const visit = async (spec: Record<string, unknown>, parent: string): Promise<void> => {
+    const path = await insert(spec, parent)
+    const children = Array.isArray(spec.children) ? (spec.children as Record<string, unknown>[]) : []
+    for (const child of children) await visit(child, path)
+  }
+
+  try {
+    await visit(tree, parentPath)
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    if (paths.length === 0) {
+      throw new Error(`${reason} (no node was inserted, so the document is unchanged)`)
+    }
+    const root = paths[0]
+    try {
+      // Deliberately not tied to the caller's AbortSignal: a cancelled or timed-out
+      // call must still clean up, or the document would keep a partial subtree.
+      await client.request({ action: 'delete_node', path: root })
+    } catch (rollbackError) {
+      const rollbackReason = rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+      throw new Error(
+        `${reason}. Rollback failed too: deleting '${root}' returned ${rollbackReason}; ` +
+          'the partially built subtree is still in the document.',
+      )
+    }
+    throw new Error(`${reason} (rolled back: deleted '${root}' and every node created under it)`)
+  }
+
+  return {
+    strategy: 'insert_node-dfs',
+    created: paths.length,
+    path: paths[0],
+    text: rootText,
+    parentPath,
+    nodeCount,
+  }
+}
+
+/**
+ * Build a subtree, preferring the bridge's bulk `apply_subtree` action.
+ *
+ * The documented protocol (v1) has no such action and answers `unknown_action`;
+ * that is not an error worth showing a user, so the capability is remembered on
+ * first contact and every later call goes straight to the `insert_node` path.
+ * Any other bridge error is a real failure and is propagated unchanged.
+ */
+async function applySubtree(
+  client: BridgeClient,
+  capability: { native: boolean | undefined },
+  parentPath: string,
+  tree: Record<string, unknown>,
+  options: { reveal: boolean; signal?: AbortSignal },
+): Promise<BuiltSubtree> {
+  if (capability.native !== false) {
+    try {
+      const payload: Record<string, unknown> = { action: 'apply_subtree', parent: parentPath, tree }
+      if (!options.reveal) payload.reveal = false
+
+      const response = await client.request(payload, options.signal)
+      capability.native = true
+      return {
+        strategy: 'apply_subtree',
+        created: typeof response.created === 'number' ? response.created : countSubtreeNodes(tree),
+        path: typeof response.path === 'string' ? response.path : '',
+        text: typeof response.text === 'string' ? response.text : '',
+        parentPath: typeof response.parentPath === 'string' ? response.parentPath : parentPath,
+        nodeCount: typeof response.nodeCount === 'number' ? response.nodeCount : undefined,
+      }
+    } catch (error) {
+      if (!(error instanceof BridgeCommandError) || error.status !== 'unknown_action') throw error
+      capability.native = false
+    }
+  }
+
+  return await buildSubtreeWithInsertNode(client, parentPath, tree, options)
+}
+
+// ---------------------------------------------------------------------------
+// Stage guard
+// ---------------------------------------------------------------------------
+
+/**
+ * The editor's own "Add Stage" toolbox action builds Stage -> TaskNode -> Folder "Initialize"
+ * -> StageBG before the node ever reaches the document (`PluginToolbox.AddStageNode`). The
+ * bridge has no such defaulting: `TreeActions.InsertNodeCore` creates exactly the node it was
+ * asked for, so a bridge-created Stage used to arrive with no children at all and compiled to a
+ * stage without a background.
+ *
+ * Every tree-building tool therefore repairs the Stages it creates: a missing `Initialize`
+ * folder is added, a missing background node is added inside it. A Stage that already has both
+ * is left untouched, and an existing background elsewhere under the Stage is never duplicated.
+ */
+const STAGE_TYPE_NAME = 'Stage'
+const STAGE_BACKGROUND_TYPE = 'StageBG'
+const INITIALIZE_FOLDER_NAME = 'Initialize'
+const DEFAULT_STAGE_BACKGROUND = 'temple_background'
+
+/** What the bridge's `get_tree` returns for one node: only the fields the guard reads. */
+interface TreeNodeView {
+  path?: string
+  type?: string
+  typeFullName?: string
+  attributes?: Array<{ name?: string; value?: string }>
+  children?: TreeNodeView[]
+}
+
+/** How one Stage was repaired. `path` is always the Stage, never a child. */
+interface StageInitialization {
+  path: string
+  action: 'created' | 'folder-added' | 'background-added' | 'already-initialized' | 'failed'
+  folderPath?: string
+  backgroundPath?: string
+  background?: string
+  error?: string
+}
+
+/** Result of guarding every Stage created by one tool call. */
+interface StageGuardSummary {
+  stages: number
+  initialized: number
+  alreadyInitialized: number
+  items: StageInitialization[]
+  /** Document node count after the last repair insert, when the bridge reported one. */
+  nodeCount?: number
+  warning?: string
+}
+
+function isStageNode(node: TreeNodeView): boolean {
+  if (node.type === STAGE_TYPE_NAME) return true
+  const fullName = typeof node.typeFullName === 'string' ? node.typeFullName : ''
+  return fullName.endsWith('.Stage.Stage')
+}
+
+function isStageBackgroundNode(node: TreeNodeView): boolean {
+  if (node.type === STAGE_BACKGROUND_TYPE) return true
+  const fullName = typeof node.typeFullName === 'string' ? node.typeFullName : ''
+  return fullName.endsWith('.StageBG')
+}
+
+function attributeValue(node: TreeNodeView, name: string): string {
+  const attributes = Array.isArray(node.attributes) ? node.attributes : []
+  const exact = attributes.find((item) => item?.name === name)
+  const match = exact ?? attributes.find((item) => (item?.name ?? '').toLowerCase() === name.toLowerCase())
+  return typeof match?.value === 'string' ? match.value.trim() : ''
+}
+
+function findInitializeFolder(stage: TreeNodeView): TreeNodeView | undefined {
+  const children = Array.isArray(stage.children) ? stage.children : []
+  return children.find(
+    (child) =>
+      child?.type === 'Folder' && attributeValue(child, 'Name').toLowerCase() === INITIALIZE_FOLDER_NAME.toLowerCase(),
+  )
+}
+
+function containsStageBackground(node: TreeNodeView): boolean {
+  if (isStageBackgroundNode(node)) return true
+  for (const child of Array.isArray(node.children) ? node.children : []) {
+    if (containsStageBackground(child)) return true
+  }
+  return false
+}
+
+function collectStageNodes(node: TreeNodeView, found: TreeNodeView[] = []): TreeNodeView[] {
+  if (isStageNode(node)) found.push(node)
+  for (const child of Array.isArray(node.children) ? node.children : []) collectStageNodes(child, found)
+  return found
+}
+
+/** Whether a normalized `apply_subtree` spec creates at least one Stage. */
+function subtreeSpecHasStage(spec: Record<string, unknown>): boolean {
+  const type = typeof spec.type === 'string' ? spec.type : ''
+  if (type === STAGE_TYPE_NAME || type.endsWith('.Stage')) return true
+  const children = Array.isArray(spec.children) ? (spec.children as Record<string, unknown>[]) : []
+  return children.some((child) => subtreeSpecHasStage(child))
+}
+
+async function readTreeNode(client: BridgeClient, path: string, signal?: AbortSignal): Promise<TreeNodeView> {
+  const response = await client.request({ action: 'get_tree', path, maxDepth: 0, attributes: true }, signal)
+  const tree = response.tree
+  if (tree === null || typeof tree !== 'object') {
+    throw new Error(`the bridge returned no tree for '${path}'`)
+  }
+  return tree as TreeNodeView
+}
+
+/** Path and document node count the bridge reports for one inserted node. */
+interface InsertOutcome {
+  path: string
+  nodeCount?: number
+}
+
+/** Inserts one node and returns where the bridge put it. */
+async function insertNodeUnder(
+  client: BridgeClient,
+  parent: string,
+  type: string,
+  attributes: Record<string, string>,
+  index: number | undefined,
+  signal?: AbortSignal,
+): Promise<InsertOutcome> {
+  const payload: Record<string, unknown> = { action: 'insert_node', parent, type, attributes, reveal: false }
+  if (index !== undefined) payload.index = index
+  const response = await client.request(payload, signal)
+  const path = typeof response.path === 'string' ? response.path.trim() : ''
+  if (path === '') throw new Error(`the bridge inserted "${type}" but returned no path for the new node`)
+  return {
+    path,
+    ...(typeof response.nodeCount === 'number' ? { nodeCount: response.nodeCount } : {}),
+  }
+}
+
+/** What one Stage repair changed, plus the document size after the last insert. */
+interface StageGuardOutcome {
+  result: StageInitialization
+  nodeCount?: number
+}
+
+/**
+ * Makes one Stage satisfy the invariant: an `Initialize` folder that contains a background node.
+ *
+ * @param client - bridge connection.
+ * @param stage - snapshot of the Stage, as returned by `get_tree`.
+ * @param signal - tool cancellation.
+ * @returns what was repaired, for the tool's response.
+ */
+async function guardStageNode(
+  client: BridgeClient,
+  stage: TreeNodeView,
+  signal?: AbortSignal,
+): Promise<StageGuardOutcome> {
+  const stagePath = typeof stage.path === 'string' ? stage.path.trim() : ''
+  if (stagePath === '') throw new Error('the bridge returned a Stage node without a path')
+
+  const folder = findInitializeFolder(stage)
+
+  if (folder !== undefined) {
+    if (containsStageBackground(folder)) {
+      return {
+        result: {
+          path: stagePath,
+          action: 'already-initialized',
+          ...(typeof folder.path === 'string' ? { folderPath: folder.path } : {}),
+        },
+      }
+    }
+    const folderPath = typeof folder.path === 'string' && folder.path.trim() !== '' ? folder.path : `${stagePath}/0`
+    const background = await insertNodeUnder(
+      client,
+      folderPath,
+      STAGE_BACKGROUND_TYPE,
+      { Background: DEFAULT_STAGE_BACKGROUND },
+      0,
+      signal,
+    )
+    return {
+      result: {
+        path: stagePath,
+        action: 'background-added',
+        folderPath,
+        backgroundPath: background.path,
+        background: DEFAULT_STAGE_BACKGROUND,
+      },
+      ...(background.nodeCount === undefined ? {} : { nodeCount: background.nodeCount }),
+    }
+  }
+
+  // First child, so the background is set before anything else the stage does.
+  const createdFolder = await insertNodeUnder(
+    client,
+    stagePath,
+    'Folder',
+    { Name: INITIALIZE_FOLDER_NAME },
+    0,
+    signal,
+  )
+
+  if (containsStageBackground(stage)) {
+    // The Stage already has a background somewhere else; never create a second one, because
+    // both would be emitted as `New(background)` at stage start.
+    return {
+      result: { path: stagePath, action: 'folder-added', folderPath: createdFolder.path },
+      ...(createdFolder.nodeCount === undefined ? {} : { nodeCount: createdFolder.nodeCount }),
+    }
+  }
+
+  const background = await insertNodeUnder(
+    client,
+    createdFolder.path,
+    STAGE_BACKGROUND_TYPE,
+    { Background: DEFAULT_STAGE_BACKGROUND },
+    0,
+    signal,
+  )
+  return {
+    result: {
+      path: stagePath,
+      action: 'created',
+      folderPath: createdFolder.path,
+      backgroundPath: background.path,
+      background: DEFAULT_STAGE_BACKGROUND,
+    },
+    ...(background.nodeCount === undefined ? {} : { nodeCount: background.nodeCount }),
+  }
+}
+
+/**
+ * Guards every Stage at or below `rootPath`.
+ *
+ * Stages never nest inside each other (`Stage` requires a `StageGroup` parent), so repairing one
+ * Stage only shifts indexes below it and the paths of its sibling Stages stay valid.
+ */
+async function guardStagesUnder(
+  client: BridgeClient,
+  rootPath: string,
+  signal?: AbortSignal,
+): Promise<StageGuardSummary | undefined> {
+  const root = await readTreeNode(client, rootPath, signal)
+  const stages = collectStageNodes(root)
+  if (stages.length === 0) return undefined
+
+  const items: StageInitialization[] = []
+  let nodeCount: number | undefined
+  for (const stage of stages) {
+    const path = typeof stage.path === 'string' ? stage.path : ''
+    try {
+      const outcome = await guardStageNode(client, stage, signal)
+      items.push(outcome.result)
+      if (outcome.nodeCount !== undefined) nodeCount = outcome.nodeCount
+    } catch (error) {
+      items.push({ path, action: 'failed', error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+
+  const failed = items.filter((item) => item.action === 'failed')
+  const initialized = items.filter(
+    (item) => item.action === 'created' || item.action === 'folder-added' || item.action === 'background-added',
+  )
+
+  return {
+    stages: items.length,
+    initialized: initialized.length,
+    alreadyInitialized: items.filter((item) => item.action === 'already-initialized').length,
+    items,
+    ...(nodeCount === undefined ? {} : { nodeCount }),
+    ...(failed.length > 0
+      ? {
+          warning:
+            `${failed.length} Stage node(s) still miss the Initialize folder or the background: ` +
+            failed.map((item) => `${item.path} (${item.error ?? 'unknown error'})`).join('; ') +
+            '. Add them by hand before running the stage.',
+        }
+      : {}),
+  }
+}
+
+/** `guardStagesUnder` that never turns a successful insert into a failed tool call. */
+async function tryGuardStages(
+  client: BridgeClient,
+  rootPath: string,
+  signal?: AbortSignal,
+): Promise<StageGuardSummary | undefined> {
+  try {
+    return await guardStagesUnder(client, rootPath, signal)
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    return {
+      stages: 0,
+      initialized: 0,
+      alreadyInitialized: 0,
+      items: [],
+      warning:
+        `the node was inserted, but the Stage initialization check failed (${reason}); ` +
+        'make sure the Stage owns an "Initialize" folder with a background node.',
+    }
+  }
+}
+
 /** Keep the output small when a node carries a long value, especially Code. */
 function changeRecord(name: string, oldValue: string, newValue: string): Record<string, unknown> {
   const isCode = name.toLowerCase() === 'code'
@@ -162,6 +669,94 @@ function rewriteScriptResponse(response: BridgeResponse): Record<string, unknown
   return safe
 }
 
+// ---------------------------------------------------------------------------
+// Screenshot
+// ---------------------------------------------------------------------------
+
+/** Bridge action that returns the editor window as a Base64 PNG (see csharp/take-screenshot.cs). */
+const SCREENSHOT_ACTION = 'take_screenshot'
+const DEFAULT_WINDOW_TITLE = 'LuaSTG Editor'
+
+/** One PNG in the system temp directory: the workspace is never touched. */
+function defaultScreenshotPath(): string {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const random = Math.random().toString(36).slice(2, 8)
+  return join(tmpdir(), `luastg_shot_${stamp}_${random}.png`)
+}
+
+/** Deletes a temp file and never lets a cleanup failure mask the real result. */
+function removeQuietly(file: string): void {
+  try {
+    unlinkSync(file)
+  } catch {
+    // Already gone (bridge path writes nothing) or locked: the OS reclaims temp files anyway.
+  }
+}
+
+/** Writes `image` to `file` (creating its directory) and returns the path. */
+function writeOnce(file: string, image: Buffer): string {
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(file, image)
+  return file
+}
+
+function captureWindowScriptPath(): string {
+  // lib/index.js -> ../scripts/capture-window.ps1
+  return fileURLToPath(new URL('../scripts/capture-window.ps1', import.meta.url))
+}
+
+/**
+ * Captures the editor window with `scripts/capture-window.ps1`.
+ *
+ * This is the fallback for a protocol-v1 bridge: it needs no editor rebuild, but it needs a
+ * desktop session, so it is Windows only and can be switched off with `captureFallback: false`.
+ */
+function runWindowCapture(out: string, titleLike: string, timeoutMs: number): void {
+  if (process.platform !== 'win32') {
+    throw new Error('the bridge has no take_screenshot action and local capture only works on Windows')
+  }
+
+  const script = captureWindowScriptPath()
+  if (!existsSync(script)) throw new Error(`the local capture script is missing: ${script}`)
+
+  const result = spawnSync(
+    'powershell.exe',
+    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-Out', out, '-TitleLike', titleLike],
+    { stdio: 'ignore', timeout: timeoutMs, windowsHide: true },
+  )
+
+  if (result.error !== undefined) throw new Error(`powershell could not run: ${result.error.message}`)
+  if (result.status !== 0) throw new Error(`the capture script failed with exit code ${result.status}`)
+  if (!existsSync(out)) throw new Error('the capture script finished without writing the PNG')
+}
+
+function screenshotResult(
+  client: BridgeClient,
+  source: 'bridge' | 'powershell',
+  image: Buffer,
+  windowTitle: string,
+  startedAt: number,
+  keptFile?: string,
+): Record<string, unknown> {
+  return {
+    ok: true,
+    source,
+    transport: 'tcp',
+    endpoint: client.endpoint,
+    action: SCREENSHOT_ACTION,
+    format: 'png',
+    bytes: image.length,
+    window: windowTitle,
+    imageBase64: image.toString('base64'),
+    // Burn after reading is the default: the bridge path never writes a file, the local path is
+    // deleted before this value is returned. keep_file opts out and reports where the PNG lives.
+    temporaryFileWritten: source === 'powershell' || keptFile !== undefined,
+    temporaryFileDeleted: keptFile === undefined,
+    ...(keptFile === undefined ? {} : { kept: true, path: keptFile }),
+    elapsedMs: Math.round(performance.now() - startedAt),
+  }
+}
+
 /**
  * Register the LuaSTG tools on the host context.
  * @param ctx - host context providing the tool registry.
@@ -172,8 +767,11 @@ export function apply(ctx: ToolHostContext, config: ConfigShape = {}): void {
   const port = boundedInteger(config.port, 8090, 1, 65535, 'port')
   const timeoutMs = boundedInteger(config.timeoutMs, 5000, 100, 60_000, 'timeoutMs')
   const defaultMaxDepth = boundedInteger(config.maxDepth, 0, 0, 512, 'maxDepth')
+  const captureFallback = config.captureFallback !== false
   const client = new BridgeClient({ host, port, timeoutMs })
   const toolTimeout = Math.min(120_000, Math.max(15_000, timeoutMs + 10_000))
+  /** Whether this bridge implements the bulk `apply_subtree` action (undefined = untested). */
+  const subtreeCapability: { native: boolean | undefined } = { native: undefined }
 
   ctx.tools.register(
     defineTool({
@@ -365,7 +963,9 @@ export function apply(ctx: ToolHostContext, config: ConfigShape = {}): void {
         'a real InsertCommand on its UI thread, so Undo/Redo and the WPF tree refresh keep working. Returns the new ' +
         "node's path, type, text, parentPath, index, selected and nodeCount. Paths are positional: later siblings " +
         'shift, so re-read the tree before addressing other nodes. The legacy parent_id ("0.4") is accepted as a ' +
-        'deprecated alias for parent.',
+        'deprecated alias for parent. Inserting a Stage also repairs the editor defaults the bridge cannot apply: a ' +
+        'missing Folder "Initialize" and its background node (StageBG, temple_background) are added automatically and ' +
+        'reported in stageDefaults, so a generated Stage never comes out empty.',
       parameters: {
         parent: {
           type: 'string',
@@ -429,13 +1029,106 @@ export function apply(ctx: ToolHostContext, config: ConfigShape = {}): void {
           const startedAt = performance.now()
           const response = await client.request(payload, exec.signal)
 
+          // A Stage inserted through the bridge has no children; the editor's own "Add Stage"
+          // toolbox action would have built Folder "Initialize" -> StageBG for it. Repair that
+          // here so a generated stage never compiles without a background.
+          const createdPath = typeof response.path === 'string' ? response.path.trim() : ''
+          const createdType = typeof response.type === 'string' ? response.type : ''
+          const createdFullName = typeof response.typeFullName === 'string' ? response.typeFullName : ''
+          const stageDefaults =
+            createdPath !== '' && (createdType === STAGE_TYPE_NAME || createdFullName.endsWith('.Stage.Stage'))
+              ? await tryGuardStages(client, createdPath, exec.signal)
+              : undefined
+
           return {
             ...envelope(client, 'insert_node', response, startedAt),
             parentPath: typeof response.parentPath === 'string' ? response.parentPath : reference.path,
+            ...(stageDefaults === undefined ? {} : { stageDefaults }),
+            ...(stageDefaults?.nodeCount === undefined ? {} : { nodeCount: stageDefaults.nodeCount }),
             pathNote: POSITIONAL_PATH_NOTE,
           }
         } catch (error) {
           toolError('luastg_add_node', error)
+        }
+      },
+    }),
+  )
+
+  ctx.tools.register(
+    defineTool({
+      name: 'luastg_apply_subtree',
+      description:
+        'Build a whole nested node tree in ONE call in the project open in LuaSTG Editor Sharp X. ' +
+        'Pass a nested JSON object: {"type":"TaskNode","attributes":{},"children":[{"type":"TaskWait",' +
+        '"attributes":{"Time":"60"}}]}. Types accept the same class name, full name or .lstges shorthand as ' +
+        'luastg_add_node. The bridge protocol v1 has no bulk subtree action, so every node is created through a real ' +
+        'InsertCommand on the editor UI thread, depth-first via insert_node; a bridge that does implement ' +
+        'apply_subtree is used in one round trip instead. If any node is rejected, the nodes already created are ' +
+        'deleted again, so the document is left as it was found. Use this instead of a chain of luastg_add_node ' +
+        'calls: it keeps parent/child paths consistent and avoids positional-path drift between inserts. Returns ' +
+        'created, the root path, text, parentPath, nodeCount and strategy. Every Stage in the tree gets the same ' +
+        'default repair as luastg_add_node: a missing Folder "Initialize" with a StageBG (temple_background) is ' +
+        'added, an existing background is never duplicated, and the result is reported in stageDefaults. ' +
+        NATIVE_FIRST_NOTE,
+      parameters: {
+        parent: {
+          type: 'string',
+          description:
+            'Positional path of the parent that receives the subtree root, for example "0" (root) or "0/2/0". Defaults to "0".',
+        },
+        tree: {
+          type: 'object',
+          additionalProperties: true,
+          required: true,
+          description:
+            'Nested node spec: {"type": "...", "attributes": {"AttrCap": "value"}, "children": [ ...same shape... ]}. ' +
+            'Attribute names must match the node caption exactly (case insensitive fallback).',
+        },
+        reveal: {
+          type: 'boolean',
+          description: 'Expand ancestors and select the new root afterwards. Defaults to true.',
+        },
+      },
+      output: {
+        schema: { type: 'json' },
+        render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+      },
+      timeoutMs: toolTimeout,
+      async execute(args, exec) {
+        try {
+          const reference = resolveNodeReference(args as Record<string, unknown>, {
+            pathKey: 'parent',
+            defaultPath: '0',
+          })
+          const tree = normalizeSubtree(args.tree)
+          const reveal = args.reveal !== false
+
+          const startedAt = performance.now()
+          const built = await applySubtree(client, subtreeCapability, reference.path, tree, {
+            reveal,
+            signal: exec.signal,
+          })
+
+          // Same guard as luastg_add_node, for every Stage the tree spec created.
+          const stageDefaults =
+            built.path !== '' && subtreeSpecHasStage(tree)
+              ? await tryGuardStages(client, built.path, exec.signal)
+              : undefined
+
+          return {
+            ...envelope(client, built.strategy === 'apply_subtree' ? 'apply_subtree' : 'insert_node', {}, startedAt),
+            strategy: built.strategy,
+            created: built.created,
+            path: built.path,
+            text: built.text,
+            parentPath: built.parentPath,
+            ...(built.nodeCount === undefined ? {} : { nodeCount: built.nodeCount }),
+            ...(stageDefaults === undefined ? {} : { stageDefaults }),
+            ...(stageDefaults?.nodeCount === undefined ? {} : { nodeCount: stageDefaults.nodeCount }),
+            pathNote: POSITIONAL_PATH_NOTE,
+          }
+        } catch (error) {
+          toolError('luastg_apply_subtree', error)
         }
       },
     }),
@@ -557,6 +1250,93 @@ export function apply(ctx: ToolHostContext, config: ConfigShape = {}): void {
           }
         } catch (error) {
           toolError('luastg_update_script', error)
+        }
+      },
+    }),
+  )
+
+  ctx.tools.register(
+    defineTool({
+      name: 'luastg_take_screenshot',
+      description:
+        'Capture the currently open LuaSTG Editor Sharp X window and save it as a PNG. Prefers the bridge action ' +
+        'take_screenshot (Base64 PNG rendered from the WPF window); when the installed bridge predates that action ' +
+        'it falls back to capturing the window locally with PowerShell, so no editor restart is needed. The PNG is ' +
+        'returned as Base64 (imageBase64) and its byte size plus the window title are reported. Nothing is left on ' +
+        'disk: the bridge path never writes a file, and the local capture writes one file under the system temp ' +
+        'directory that is deleted again before this tool returns — even when the capture fails. Pass window_title ' +
+        'to match another window ("LuaSTG Editor" by default).',
+      parameters: {
+        window_title: {
+          type: 'string',
+          description:
+            'Substring of the window title, used only by the local capture fallback. Defaults to "LuaSTG Editor".',
+        },
+        keep_file: {
+          type: 'boolean',
+          description:
+            'Keep the PNG on disk instead of deleting it, and return its absolute path. Needed when something has ' +
+            'to open the image (read_image, a review loop); the default false leaves nothing behind.',
+        },
+      },
+      output: {
+        schema: { type: 'json' },
+        render: (_args, value) => {
+          const record = value as Record<string, unknown>
+          return [
+            {
+              type: 'text',
+              text:
+                `Captured the editor window "${String(record.window ?? '')}" ` +
+                `(${String(record.bytes ?? 0)} bytes PNG, via ${String(record.source)}). ` +
+                'The image is delivered as Base64 in the structured result (imageBase64); ' +
+                'no temporary file is left behind.',
+            },
+          ]
+        },
+      },
+      timeoutMs: toolTimeout,
+      async execute(args, exec) {
+        const windowTitle = text(args.window_title) || DEFAULT_WINDOW_TITLE
+        const keepFile = args.keep_file === true
+        const startedAt = performance.now()
+        // Only the PowerShell fallback needs a file; it is removed in `finally` unless keep_file.
+        const tempFile = defaultScreenshotPath()
+        let keepPath: string | undefined
+
+        try {
+          // 1) Ask the bridge for the window bitmap: it answers Base64 and writes nothing.
+          try {
+            const response = await client.request({ action: SCREENSHOT_ACTION, format: 'png' }, exec.signal)
+            const base64 = typeof response.imageBase64 === 'string' ? response.imageBase64 : ''
+            if (base64 === '') throw new Error('the bridge answered take_screenshot without imageBase64')
+
+            const image = Buffer.from(base64, 'base64')
+            if (keepFile) keepPath = writeOnce(tempFile, image)
+            return screenshotResult(client, 'bridge', image, windowTitle, startedAt, keepPath)
+          } catch (error) {
+            // A bridge that predates the action is expected: fall back to a local capture.
+            if (!(error instanceof BridgeCommandError) || error.status !== 'unknown_action') throw error
+          }
+
+          // 2) Fallback: capture the window from this machine, then read and burn it.
+          if (!captureFallback) {
+            throw new Error(
+              'the installed bridge has no take_screenshot action and captureFallback is disabled; ' +
+                'rebuild the C# bridge with csharp/take-screenshot.cs or enable captureFallback',
+            )
+          }
+
+          mkdirSync(dirname(tempFile), { recursive: true })
+          runWindowCapture(tempFile, windowTitle, toolTimeout)
+          const image = readFileSync(tempFile)
+          if (keepFile) keepPath = tempFile
+          return screenshotResult(client, 'powershell', image, windowTitle, startedAt, keepPath)
+        } catch (error) {
+          toolError('luastg_take_screenshot', error)
+        } finally {
+          // Burn after reading, unless keep_file asked for a physical file on purpose.
+          if (keepPath === undefined) removeQuietly(tempFile)
         }
       },
     }),

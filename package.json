@@ -12,6 +12,8 @@
     "lib",
     "cordis.patch.yml",
     "docs",
+    "scripts/capture-window.ps1",
+    "csharp",
     "README.md"
   ],
   "keywords": [

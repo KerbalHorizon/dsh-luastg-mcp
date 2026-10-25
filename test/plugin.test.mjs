@@ -30,10 +30,11 @@ test('exports the plugin contract with the bridge defaults', { skip }, () => {
     port: 8090,
     timeoutMs: 5000,
     maxDepth: 0,
+    captureFallback: true,
   })
 })
 
-test('registers the five path-based tools and no removed tools', { skip }, () => {
+test('registers the six path-based tools and no removed tools', { skip }, () => {
   const { host, byName } = register()
   assert.deepEqual(
     host.registered.map((definition) => definition.name),
@@ -41,8 +42,10 @@ test('registers the five path-based tools and no removed tools', { skip }, () =>
       'luastg_get_nodes',
       'luastg_update_node',
       'luastg_add_node',
+      'luastg_apply_subtree',
       'luastg_delete_node',
       'luastg_update_script',
+      'luastg_take_screenshot',
     ],
   )
   assert.equal(byName.has('luastg_search_nodes'), false)
@@ -117,6 +120,7 @@ test('keeps explicit bridge settings in the resolved config', { skip }, () => {
     port: 6553,
     timeoutMs: 1500,
     maxDepth: 3,
+    captureFallback: true,
   })
 
   const { byName } = register({ port: 6553, timeoutMs: 1500 })

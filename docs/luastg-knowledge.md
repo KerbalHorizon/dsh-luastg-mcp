@@ -11,7 +11,7 @@
 > 依据：`LuaSTGNode.Legacy/EditorData/Node/Enemy/{EnemyDefine,EnemyInit,CreateEnemy}.cs` 源码
 > ＋真实工程存档 `Hakureisama.lstges`。
 
-### 0.1 三条硬规则
+### 0.1 四条硬规则
 
 1. **选型分两类：实体走 Define + Create，普通弹幕走内置 Simple Bullet 节点。**
    - **敌机 / Boss / 带独立复杂逻辑的对象**（有血量、掉落、受击、死亡，要按
@@ -31,6 +31,23 @@
 3. **定义先于引用。**
    生成的 Lua 按节点树顺序输出，`_editor_class["MyTank"]` 必须出现在使用它的 Stage
    代码之前。所以资源目录永远排在 `StageGroup` 前面；新增 Define 后不要把它拖到关卡后面。
+4. **铁律：Stage 不允许是空壳。**
+   凡是要生成 `Stage` 节点，其子节点**必须**包含 `Initialize` 文件夹（`General.Folder`，
+   `Name = "Initialize"`）和一个背景设置节点（`StageBG`，`Background = temple_background`
+   等）。**绝对不允许生成没有任何子节点的空 `Stage`**，否则关卡缺少初始化段，运行到该关
+   时会直接报错。路径固定为：
+
+   ```
+   Stage                       [RequireParent(StageGroup)]
+   └─ Folder "Initialize"
+      └─ StageBG               Background=temple_background   ← New(_editor_class[...] or ...)
+   ```
+
+   > 依据：编辑器 UI 的 “Add Stage”（`PluginToolbox.AddStageNode`）就是这么建默认子节点的；
+   > 但桥接 API 直接调 `InsertNodeCore`，**不会**套用这层默认值，所以只能由生成侧自己补。
+   > 本仓库的 `luastg_add_node` / `luastg_apply_subtree` 已内置兜底：新建 `Stage` 后自动
+   > 检测并补 `Initialize` + `StageBG`，结果放在响应的 `stageDefaults` 里。手写节点树时同样
+   > 必须显式带上这两个节点。
 
 ### 0.2 标准资源目录
 
@@ -45,6 +62,8 @@ File（RootFolder）
 │  └─ Bosses
 └─ StageGroup "Stage 1"           ← 关卡脚本永远排在资源之后
    └─ Stage "Stage 1"
+      ├─ Folder "Initialize"      ← 铁律 4：必须有，且带 StageBG
+      │  └─ StageBG
       └─ TaskNode
          └─ CreateEnemy
 ```
@@ -70,13 +89,22 @@ File（RootFolder）
 - [ ] 敌机行为写在 `EnemyInit` 的 `TaskNode` 里，而不是每个实例各抄一遍；
 - [ ] 普通弹幕用的是 `CreateSimpleBullet` / `CreateSimpleBulletGroup`，
       没有为一发子弹去建 `BulletDefine`（见 [节点选用决策树](#节点选用决策树decision-matrix)）；
-- [ ] 工程里没有 `CreateSimpleEnemy`，也没有用一个大 `Code` 代替整棵树。
+- [ ] 工程里没有 `CreateSimpleEnemy`，也没有用一个大 `Code` 代替整棵树；
+- [ ] 每个 `Stage` 都有 `Folder "Initialize"` 且其中带 `StageBG`；没有空 `Stage`
+      （见 [0.1 铁律 4](#01-四条硬规则)）。
 
 ---
 
 ## 最高指导原则：原生节点优先（NATIVE FIRST）
 
 > **除非原生节点绝对无法表达该逻辑，否则禁止使用 `General.Code` 节点。**
+
+> **铁律（与上一条同级，冲突时优先）：凡是要生成 `Stage` 节点，其子节点必须包含
+> `Initialize` 文件夹及背景设置节点（`StageBG`），绝对不允许生成空 `Stage`，否则会导致
+> 引擎报错。**
+> 判定只看两点，缺一即补：① `Stage` 下有没有 `Name = "Initialize"` 的 `Folder`；
+> ② 该文件夹里有没有 `StageBG`。桥接插入不会套用编辑器 UI 的默认子节点，生成侧必须自己保证
+> （`luastg_add_node` / `luastg_apply_subtree` 已自动兜底，见 [0.1 铁律 4](#01-四条硬规则)）。
 
 判定顺序（自上而下，命中即停）：
 
@@ -103,6 +131,8 @@ Resources/Tanks
 
 Stage 1
 └─ Stage
+   ├─ Folder "Initialize"                  ← 铁律 4：Stage 必带
+   │  └─ StageBG  Background=temple_background
    └─ TaskNode
       └─ CreateEnemy  Name="\"fairy\"", Position="320,240"
                                            → New(_editor_class["fairy"], 320, 240, _)
@@ -267,7 +297,8 @@ RootFolder                                  ← 文档根，depth = 0
 │        └─ BossSCFinish
 └─ StageGroup "SpellCard"                   [ClassNode] → stage.group.New(...)
    └─ Stage "SpellCard"                     [RequireParent(StageGroup)] → stage.group.AddStage(...)
-      ├─ StageBG                            → 设置背景
+      ├─ Folder "Initialize"                ← **必须有**（铁律 4），且必须先于关卡流程
+      │  └─ StageBG                          Background=temple_background → 设置背景
       ├─ TaskNode                           [RequireAncestor(CodeAlike)] ← Stage 满足
       │  ├─ Code
       │  ├─ TaskWait
@@ -278,7 +309,7 @@ RootFolder                                  ← 文档根，depth = 0
 
 **一句话记法**：
 
-> `StageGroup` 管"这一关的初始资源（残机/火力/信仰/炸弹）"；`Stage` 管"这一关的脚本"；`EnemyDefine`/`BulletDefine`/`BossDefine` 是"类型表"；`*Init` 是"类型的构造体（唯一）"；`TaskNode` 是"一个协程"，`TaskWait`/`TaskMoveTo` 只能活在协程里；`Code` 是"逃生舱"，哪都能挂，直接写 Lua。
+> `StageGroup` 管"这一关的初始资源（残机/火力/信仰/炸弹）"；`Stage` 管"这一关的脚本"（且必带 `Initialize` → `StageBG` 初始化块）；`EnemyDefine`/`BulletDefine`/`BossDefine` 是"类型表"；`*Init` 是"类型的构造体（唯一）"；`TaskNode` 是"一个协程"，`TaskWait`/`TaskMoveTo` 只能活在协程里；`Code` 是"逃生舱"，哪都能挂，直接写 Lua。
 
 > 层级图里的 `BulletDefine` 只说明"这个角色可以挂在这里"，**不是**要求普通弹幕也这么写：
 > 直线、扇形、环弹、自机狙用 `CreateSimpleBullet` / `CreateSimpleBulletGroup` 就够，

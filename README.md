@@ -151,15 +151,17 @@ WPF UI 线程上执行真实命令。效果是模型改完之后，用户**当�
 
 ---
 
-## 3. 五个核心工具
+## 3. 七个核心工具
 
 | 工具 | 读写 | 桥接 action | 作用 |
 |---|---|---|---|
 | `luastg_get_nodes` | 只读 | `get_tree` | 读取当前活动文档的节点树 |
 | `luastg_update_node` | 写入 | `set_attribute` × N | 修改节点上已存在的属性，逐属性一条可撤销命令 |
 | `luastg_add_node` | 写入 | `insert_node` | 通过 `InsertCommand` 插入一个节点 |
+| `luastg_apply_subtree` | 写入 | `insert_node`（深度优先） | 一次调用建出整棵嵌套子树 |
 | `luastg_delete_node` | 写入 | `delete_node` | 通过 `DeleteCommand` 删除一个节点及其子树 |
 | `luastg_update_script` | 写入 | `set_attribute`（`Code`） | 替换节点的 `Code` 属性（多行 Lua 脚本） |
+| `luastg_take_screenshot` | 只读 | `take_screenshot`（可选） | 截取编辑器窗口，返回 PNG 的 Base64 |
 
 ### 3.1 `luastg_get_nodes`
 
@@ -262,10 +264,71 @@ luastg_update_node: unknown_attribute: node '0' (...) has no attribute 'Missing'
 返回新节点的 `path` / `type` / `text` / `parentPath` / `index` / `selected` / `nodeCount`，
 并附 `pathNote` 提醒路径可能漂移。
 
+**插入 `Stage` 时会自动补初始化块。** 编辑器 UI 的 “Add Stage” 会建出
+`Stage → TaskNode → Folder "Initialize" → StageBG`（见 `PluginToolbox.AddStageNode`），
+而桥接的 `InsertNodeCore` 只插你指定的那一个节点，于是桥接生成的 `Stage` 会是空壳。
+插件在插入成功后立刻检查并补齐：
+
+```
+Stage "Stage 1"
+└─ Folder "Initialize"            ← 索引 0，先于关卡流程
+   └─ StageBG  Background=temple_background
+```
+
+- 结果放在响应的 `stageDefaults` 里：`{ stages, initialized, alreadyInitialized, items[], nodeCount }`，
+  `items[].action` 取值 `created` / `folder-added` / `background-added` / `already-initialized` / `failed`；
+- 已有 `Initialize` 文件夹但里面没有背景节点 → 只补背景（`background-added`）；
+- 已经有 `Stage` 下的背景节点 → 只补文件夹（`folder-added`），**绝不重复创建背景**；
+- 补节点失败时插 `Stage` 依然算成功，失败原因写进 `stageDefaults.warning`，不回滚。
+
 > 注意属性名不一定是直觉写写：`Comment` 节点的正文属性叫 **`Comment`**（不是 `Text`），
 > `Code` 节点的脚本属性叫 **`Code`**。不确定时先 `luastg_get_nodes` 看 `attributes[].name`。
 
-### 3.4 `luastg_delete_node`
+### 3.4 `luastg_apply_subtree`
+
+一次调用建出整棵嵌套子树，适合“造敌 + 等待 + 位移”这类一整段关卡逻辑。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `parent` | string | 否 | 子树根挂到哪个节点下；默认根 `"0"` |
+| `tree` | object | 是 | 嵌套结构 `{"type","attributes","children"}` |
+| `reveal` | boolean | 否 | 是否展开并选中新建节点；默认 `true` |
+
+```json
+{
+  "parent": "0",
+  "tree": {
+    "type": "StageGroup",
+    "attributes": { "Name": "Stage 1", "Start life": "7" },
+    "children": [
+      {
+        "type": "Stage",
+        "attributes": { "Name": "Stage 1" },
+        "children": [
+          { "type": "TaskNode", "children": [
+              { "type": "CreateEnemy", "attributes": { "Name": "\"fairy\"", "Position": "320,240" } }
+          ] }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`type` 的写法与 `luastg_add_node` 的 `node_type` 完全一致（类名 / 完整名 / 旧简写）。
+每一层都可以带 `attributes` 与 `children`。
+
+**实现方式**：协议 v1 里没有批量插入 action，插件会先尝试 `apply_subtree`（为将来
+的桥接版本留口），收到 `unknown_action` 后记住“该桥接不支持”，随后按**深度优先**
+逐节点发 `insert_node`：父节点先建，子节点挂到桥接返回的真实 `path` 上，路径不靠
+调用方推算。任何一步被编辑器拒绝（`unknown_attribute`、`validation_failed`、
+`unknown_node_type`…），已经建出来的节点会通过一次 `delete_node` 整体删掉，**文档
+回到调用前的样子**。
+
+> `tree` 里出现的每个 `Stage` 都会走 §3.3 的初始化补全：缺 `Initialize` 文件夹或背景节点
+> 时自动补上，已经有的不重复建；结果同样在响应的 `stageDefaults` 里。
+
+### 3.5 `luastg_delete_node`
 
 删除一个节点及其整棵子树。C# 侧执行真实 `DeleteCommand`，一次 Undo 恢复整棵子树。
 
@@ -279,7 +342,7 @@ luastg_update_node: unknown_attribute: node '0' (...) has no attribute 'Missing'
 
 删除会让后面的兄弟节点**整体前移**，因此删除后对其他节点操作前必须重新 `get_nodes`。
 
-### 3.5 `luastg_update_script`
+### 3.6 `luastg_update_script`
 
 替换节点的 `Code` 属性。实现上就是：
 
@@ -308,10 +371,43 @@ luastg_update_node: unknown_attribute: node '0' (...) has no attribute 'Missing'
 }
 ```
 
+### 3.7 `luastg_take_screenshot`
+
+截取编辑器窗口，**阅后即焚**：返回 PNG 的 Base64，不在磁盘上留任何文件。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `window_title` | string | 否 | 本地截图时匹配的窗口标题子串，默认 `"LuaSTG Editor"` |
+
+两条路径：
+
+1. **桥接优先**：发 `{"action":"take_screenshot"}`。C# 侧用 `RenderTargetBitmap` 渲染
+   `MainWindow`，直接编码进 `MemoryStream` 返回 Base64，**全程不落盘**。源码见
+   [csharp/take-screenshot.cs](csharp/take-screenshot.cs)（重建桥接后生效）。
+2. **本地兜底**：桥接返回 `unknown_action` 时，调用
+   [scripts/capture-window.ps1](scripts/capture-window.ps1) 抓窗口，写到
+   `%TEMP%\luastg_shot_<时间戳>_<随机>.png`，读进内存后**立刻 `unlink`**；
+   写在 `finally` 里，因此截图失败也同样删干净。可用配置 `captureFallback: false` 关闭。
+
+```json
+{
+  "ok": true,
+  "source": "powershell",
+  "format": "png",
+  "bytes": 221807,
+  "window": "LuaSTG Editor",
+  "imageBase64": "iVBORw0KGgoAAAANSUhEUgAA…",
+  "temporaryFileWritten": true,
+  "temporaryFileDeleted": true,
+  "elapsedMs": 1991
+}
+```
+
+图片以 Base64 放在结构化结果里；`render` 只回一段摘要，避免几 MB 的 Base64 撑爆上下文。
+
 ---
 
 ## 4. 安装步骤
-
 ### 4.1 前置条件
 
 1. **编辑器已启动并加载桥接**：`LuaSTG Editor Sharp X` 的 `editor.log` 中出现

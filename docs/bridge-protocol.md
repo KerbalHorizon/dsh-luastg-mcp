@@ -295,8 +295,15 @@ Request:
 | `luastg_get_nodes` | `get_tree` |
 | `luastg_update_node` | one `set_attribute` per entry in `attributes` |
 | `luastg_add_node` | `insert_node` |
+| `luastg_apply_subtree` | `apply_subtree` when the bridge implements it; otherwise one `insert_node` per node, depth-first, plus one `delete_node` on the subtree root if anything fails |
 | `luastg_delete_node` | `delete_node` |
 | `luastg_update_script` | `set_attribute` with `name: "Code"` |
+
+`apply_subtree` is **not** part of protocol v1: a stock `LuaSTGMcpBridge` answers
+`unknown_action` for it. The DSH tool therefore probes it once per client,
+remembers the refusal, and then builds the tree with `insert_node` calls, so a
+clean editor works without any C# change. A future bridge that adds the action
+can create the tree in one round trip and the tool switches back automatically.
 
 `luastg_search_nodes` and `luastg_batch_update` are intentionally absent: the C#
 bridge has no matching actions yet.

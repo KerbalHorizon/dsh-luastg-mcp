@@ -17,15 +17,17 @@ assert.equal(typeof plugin.Config, 'function', 'Config must be exported')
 
 const registered = []
 plugin.apply({ tools: { register: (definition) => registered.push(definition) } }, {})
-assert.equal(registered.length, 5, 'exactly five tools must register')
+assert.equal(registered.length, 7, 'exactly seven tools must register')
 
 const byName = new Map(registered.map((definition) => [definition.name, definition]))
 assert.deepEqual(
   [...byName.keys()].sort(),
   [
     'luastg_add_node',
+    'luastg_apply_subtree',
     'luastg_delete_node',
     'luastg_get_nodes',
+    'luastg_take_screenshot',
     'luastg_update_node',
     'luastg_update_script',
   ],
@@ -69,6 +71,15 @@ assert.deepEqual(
 assert.deepEqual(addTool.parameters.required, ['node_type'], 'add tool requires node_type')
 assert.equal(addTool.parameters.properties.attributes.additionalProperties, true, 'add attributes are open')
 assert.equal(addTool.parameters.properties.index.type, 'integer', 'add index is an integer')
+
+const subtreeTool = byName.get('luastg_apply_subtree')
+assert.deepEqual(
+  Object.keys(subtreeTool.parameters.properties).sort(),
+  ['parent', 'reveal', 'tree'],
+  'apply_subtree exposes parent, tree, reveal',
+)
+assert.deepEqual(subtreeTool.parameters.required, ['tree'], 'apply_subtree requires tree')
+assert.equal(subtreeTool.parameters.properties.tree.additionalProperties, true, 'tree spec is open')
 
 const deleteTool = byName.get('luastg_delete_node')
 assert.deepEqual(

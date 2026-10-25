@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { existsSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
 import { startMockBridge } from './mock-bridge.mjs'
 
 const available = typeof process.env.DSH_PACKAGES === 'string' && process.env.DSH_PACKAGES !== ''
@@ -9,6 +13,22 @@ const plugin = available ? await import('../lib/index.js') : null
 
 function exec() {
   return { signal: AbortSignal.timeout(5000) }
+}
+
+/** Nested tree the mock knows how to build: Folder -> (TaskWait, Folder -> TaskWait). */
+function sampleSubtree() {
+  return {
+    type: 'Folder',
+    attributes: { Name: 'Built' },
+    children: [
+      { type: 'TaskWait', attributes: { Time: '60' } },
+      {
+        type: 'Folder',
+        attributes: { Name: 'Inner' },
+        children: [{ type: 'TaskWait', attributes: { Time: '10' } }],
+      },
+    ],
+  }
 }
 
 async function setup(t, config = {}, options = {}) {
@@ -26,7 +46,7 @@ async function setup(t, config = {}, options = {}) {
   return { bridge, byName }
 }
 
-test('registers only the five path-based bridge tools', { skip }, () => {
+test('registers the seven path-based bridge tools', { skip }, () => {
   const registered = []
   plugin.apply({ tools: { register: (definition) => registered.push(definition) } }, {})
   assert.deepEqual(
@@ -35,8 +55,10 @@ test('registers only the five path-based bridge tools', { skip }, () => {
       'luastg_get_nodes',
       'luastg_update_node',
       'luastg_add_node',
+      'luastg_apply_subtree',
       'luastg_delete_node',
       'luastg_update_script',
+      'luastg_take_screenshot',
     ],
   )
 })
@@ -106,7 +128,7 @@ test('get_nodes turns no_document into an actionable error', { skip }, async (t)
 
   await assert.rejects(tool.execute({}, exec()), (error) => {
     assert.match(error.message, /^luastg_get_nodes: no_document:/)
-    assert.match(error.message, /打开一个 \.lstges 工程/)
+    assert.match(error.message, /打开一个 .lstges 工程/)
     return true
   })
 })
@@ -183,6 +205,273 @@ test('add_node accepts .lstges shorthand and full .NET type names', { skip }, as
   assert.equal(bridge.requests[1].type, fullName)
   assert.equal(full.type, 'Comment')
   assert.equal(full.typeFullName, fullName)
+})
+
+test('add_node gives a new Stage the Initialize folder and a background node', { skip }, async (t) => {
+  const { bridge, byName } = await setup(t)
+  const tool = byName.get('luastg_add_node')
+
+  const value = await tool.execute(
+    { parent: '0/0', node_type: 'Stage', attributes: { Name: 'Stage 3' } },
+    exec(),
+  )
+
+  assert.deepEqual(
+    bridge.requests.map((request) => [request.action, request.parent, request.type]),
+    [
+      ['insert_node', '0/0', 'Stage'],
+      ['get_tree', undefined, undefined],
+      ['insert_node', '0/0/1', 'Folder'],
+      ['insert_node', '0/0/1/0', 'StageBG'],
+    ],
+  )
+  assert.equal(bridge.requests[2].index, 0, 'the Initialize folder must be the first child')
+  assert.equal(bridge.requests[2].attributes.Name, 'Initialize')
+  assert.equal(bridge.requests[2].reveal, false, 'the repair must not steal the selection')
+  assert.equal(bridge.requests[3].attributes.Background, 'temple_background')
+
+  assert.equal(value.ok, true)
+  assert.equal(value.path, '0/0/1')
+  assert.deepEqual(value.stageDefaults, {
+    stages: 1,
+    initialized: 1,
+    alreadyInitialized: 0,
+    items: [
+      {
+        path: '0/0/1',
+        action: 'created',
+        folderPath: '0/0/1/0',
+        backgroundPath: '0/0/1/0/0',
+        background: 'temple_background',
+      },
+    ],
+    nodeCount: 10,
+  })
+  assert.equal(value.nodeCount, 10, 'nodeCount must include the nodes the repair created')
+
+  const created = bridge.document.root.children[0].children[1]
+  assert.equal(created.type, 'Stage')
+  assert.equal(created.children[0].type, 'Folder')
+  assert.equal(created.children[0].attributes[0].value, 'Initialize')
+  assert.equal(created.children[0].children[0].type, 'StageBG')
+  assert.equal(value.nodeCount, 10)
+})
+
+test('add_node leaves other node types untouched', { skip }, async (t) => {
+  const { bridge, byName } = await setup(t)
+  const tool = byName.get('luastg_add_node')
+
+  const value = await tool.execute({ parent: '0/0/0', node_type: 'TaskWait', attributes: { Time: '30' } }, exec())
+
+  assert.deepEqual(bridge.requests.map((request) => request.action), ['insert_node'])
+  assert.equal('stageDefaults' in value, false)
+})
+
+test('add_node reports a Stage it could not repair instead of failing the insert', { skip }, async (t) => {
+  const { bridge, byName } = await setup(t, {}, { rejectTypes: ['StageBG'] })
+  const tool = byName.get('luastg_add_node')
+
+  const value = await tool.execute({ parent: '0/0', node_type: 'Stage', attributes: { Name: 'Broken' } }, exec())
+
+  assert.equal(value.ok, true, 'the Stage itself was inserted, so the call succeeded')
+  assert.equal(value.stageDefaults.stages, 1)
+  assert.equal(value.stageDefaults.initialized, 0)
+  assert.equal(value.stageDefaults.items[0].action, 'failed')
+  assert.match(value.stageDefaults.items[0].error, /StageBG|rejected/i)
+  assert.match(value.stageDefaults.warning, /Initialize folder or the background/i)
+  assert.equal(bridge.requests.some((request) => request.action === 'delete_node'), false, 'nothing is rolled back')
+})
+
+test('apply_subtree repairs every Stage it creates', { skip }, async (t) => {
+  const { bridge, byName } = await setup(t)
+  const tool = byName.get('luastg_apply_subtree')
+
+  const value = await tool.execute(
+    {
+      parent: '0',
+      tree: {
+        type: 'StageGroup',
+        attributes: { Name: 'Group B' },
+        children: [{ type: 'Stage', attributes: { Name: 'Stage 3' } }],
+      },
+    },
+    exec(),
+  )
+
+  assert.deepEqual(
+    bridge.requests.map((request) => [request.action, request.parent, request.type]),
+    [
+      ['apply_subtree', '0', undefined],
+      ['insert_node', '0', 'StageGroup'],
+      ['insert_node', '0/2', 'Stage'],
+      ['get_tree', undefined, undefined],
+      ['insert_node', '0/2/0', 'Folder'],
+      ['insert_node', '0/2/0/0', 'StageBG'],
+    ],
+  )
+  assert.equal(value.strategy, 'insert_node-dfs')
+  assert.equal(value.created, 2)
+  assert.equal(value.stageDefaults.stages, 1)
+  assert.equal(value.stageDefaults.items[0].action, 'created')
+
+  const stage = bridge.document.root.children[2].children[0]
+  assert.equal(stage.type, 'Stage')
+  assert.equal(stage.children[0].type, 'Folder')
+  assert.equal(stage.children[0].children[0].type, 'StageBG')
+})
+
+test('apply_subtree never duplicates a background the tree already provides', { skip }, async (t) => {
+  const { bridge, byName } = await setup(t)
+  const tool = byName.get('luastg_apply_subtree')
+
+  const value = await tool.execute(
+    {
+      parent: '0',
+      tree: {
+        type: 'StageGroup',
+        attributes: { Name: 'Group C' },
+        children: [
+          {
+            type: 'Stage',
+            attributes: { Name: 'Stage 4' },
+            children: [
+              {
+                type: 'Folder',
+                attributes: { Name: 'Initialize' },
+                children: [{ type: 'StageBG', attributes: { Background: 'starlight_background' } }],
+              },
+            ],
+          },
+        ],
+      },
+    },
+    exec(),
+  )
+
+  const backgroundInserts = bridge.requests.filter(
+    (request) => request.action === 'insert_node' && request.type === 'StageBG',
+  )
+  assert.equal(backgroundInserts.length, 1, 'only the background from the spec exists')
+  assert.equal(backgroundInserts[0].attributes.Background, 'starlight_background')
+  assert.equal(value.stageDefaults.items[0].action, 'already-initialized')
+  assert.equal(value.stageDefaults.alreadyInitialized, 1)
+  assert.equal(value.stageDefaults.initialized, 0)
+})
+
+test('apply_subtree skips the Stage check when the tree has no Stage', { skip }, async (t) => {
+  const { bridge, byName } = await setup(t)
+  const tool = byName.get('luastg_apply_subtree')
+
+  const value = await tool.execute({ parent: '0', tree: { type: 'Comment', attributes: { Comment: 'only' } } }, exec())
+
+  assert.deepEqual(bridge.requests.map((request) => request.action), ['apply_subtree', 'insert_node'])
+  assert.equal('stageDefaults' in value, false)
+})
+
+test('apply_subtree falls back to depth-first insert_node on a protocol-v1 bridge', { skip }, async (t) => {
+  const { bridge, byName } = await setup(t)
+  const tool = byName.get('luastg_apply_subtree')
+
+  const value = await tool.execute({ parent: '0/0', tree: sampleSubtree() }, exec())
+
+  // 1) the bulk action is probed once, 2) every node then goes through insert_node.
+  assert.equal(bridge.requests[0].action, 'apply_subtree')
+  assert.deepEqual(
+    bridge.requests.slice(1).map((request) => [request.action, request.parent, request.type]),
+    [
+      ['insert_node', '0/0', 'Folder'],
+      ['insert_node', '0/0/1', 'TaskWait'],
+      ['insert_node', '0/0/1', 'Folder'],
+      ['insert_node', '0/0/1/1', 'TaskWait'],
+    ],
+  )
+  assert.equal(bridge.requests[1].attributes.Name, 'Built')
+  assert.equal(bridge.requests[1].reveal, false, 'intermediate inserts must not select rows')
+  assert.equal(bridge.requests[4].reveal, true, 'the final insert expands the whole chain')
+
+  assert.equal(value.ok, true)
+  assert.equal(value.strategy, 'insert_node-dfs')
+  assert.equal(value.created, 4)
+  assert.equal(value.path, '0/0/1')
+  assert.equal(value.parentPath, '0/0')
+  assert.equal(value.text, 'Built')
+  assert.equal(value.nodeCount, 11)
+  assert.match(value.pathNote, /positional/i)
+
+  const nested = bridge.document.root.children[0].children[1]
+  assert.equal(nested.type, 'Folder')
+  assert.equal(nested.text, 'Built')
+  assert.equal(nested.children[1].text, 'Inner')
+  assert.equal(nested.children[1].children[0].type, 'TaskWait')
+  assert.equal(nested.children[1].children[0].attributes[0].value, '10')
+})
+
+test('apply_subtree probes the bulk action only once per bridge and honours reveal:false', { skip }, async (t) => {
+  const { bridge, byName } = await setup(t)
+  const tool = byName.get('luastg_apply_subtree')
+
+  await tool.execute({ parent: '0', tree: { type: 'Comment', attributes: { Comment: 'a' } } }, exec())
+  const afterFirstCall = bridge.requests.length
+  await tool.execute({ parent: '0', tree: { type: 'Comment', attributes: { Comment: 'b' } }, reveal: false }, exec())
+
+  const probes = bridge.requests.filter((request) => request.action === 'apply_subtree')
+  assert.equal(probes.length, 1, 'unknown_action must be remembered, not retried')
+  assert.equal(bridge.requests[1].action, 'insert_node')
+  assert.equal(bridge.requests[1].reveal, true, 'the default selects the last created node')
+
+  const secondCall = bridge.requests.slice(afterFirstCall)
+  const inserts = secondCall.filter((request) => request.action === 'insert_node')
+  assert.equal(inserts.length, 1)
+  assert.equal(inserts[0].reveal, false, 'reveal:false must not touch the selection')
+})
+
+test('apply_subtree uses the bulk action when the bridge implements it', { skip }, async (t) => {
+  const { bridge, byName } = await setup(t, {}, { applySubtree: true })
+  const tool = byName.get('luastg_apply_subtree')
+
+  const value = await tool.execute({ parent: '0', tree: sampleSubtree() }, exec())
+
+  assert.deepEqual(bridge.requests.map((request) => request.action), ['apply_subtree'])
+  assert.equal(value.strategy, 'apply_subtree')
+  assert.equal(value.created, 4)
+  assert.equal(value.path, '0/2')
+  assert.equal(value.text, 'Built')
+  assert.equal(value.nodeCount, 11)
+})
+
+test('apply_subtree rolls back every created node when one insert is rejected', { skip }, async (t) => {
+  const { bridge, byName } = await setup(t)
+  const tool = byName.get('luastg_apply_subtree')
+
+  await assert.rejects(
+    tool.execute(
+      {
+        parent: '0',
+        tree: {
+          type: 'Folder',
+          attributes: { Name: 'Doomed' },
+          children: [
+            { type: 'TaskWait', attributes: { Time: '60' } },
+            { type: 'NoSuchNode' },
+          ],
+        },
+      },
+      exec(),
+    ),
+    (error) => {
+      assert.match(error.message, /^luastg_apply_subtree: unknown_node_type:/)
+      assert.match(error.message, /rolled back: deleted '0\/2'/)
+      return true
+    },
+  )
+
+  assert.deepEqual(
+    bridge.requests.map((request) => request.action),
+    ['apply_subtree', 'insert_node', 'insert_node', 'insert_node', 'delete_node'],
+  )
+  assert.equal(bridge.requests.at(-1).path, '0/2')
+  assert.equal(bridge.document.root.children.length, 2, 'the document must be back to its original shape')
+  assert.equal(bridge.document.root.children[1].text, 'Stage 2')
 })
 
 test('update_node sends one set_attribute per attribute and reports both', { skip }, async (t) => {
@@ -365,9 +654,65 @@ test('the tools explain a refused editor connection', { skip }, async () => {
   const tool = registered.find((definition) => definition.name === 'luastg_get_nodes')
 
   await assert.rejects(tool.execute({}, exec()), (error) => {
-    assert.match(error.message, /^luastg_get_nodes: 无法连接 LuaSTG 编辑器 MCP 桥接/)
+    assert.match(error.message, /^luastg_get_nodes: 无法连接/)
     assert.match(error.message, /连接失败，请确保 LuaSTG 编辑器已启动并加载了 MCP 桥接插件/)
     assert.ok(error.message.includes(`127.0.0.1:${port}`))
     return true
   })
+})
+
+test('take_screenshot returns the bridge PNG as Base64 and writes no file', { skip }, async (t) => {
+  const { bridge, byName } = await setup(t, {}, { screenshot: true })
+  const tool = byName.get('luastg_take_screenshot')
+
+  const value = await tool.execute({}, exec())
+
+  assert.deepEqual(bridge.requests[0], { action: 'take_screenshot', format: 'png' })
+  assert.equal(value.ok, true)
+  assert.equal(value.source, 'bridge')
+  assert.equal(value.format, 'png')
+  assert.equal(value.temporaryFileWritten, false, 'the bridge path must not touch the disk')
+  assert.equal(value.temporaryFileDeleted, true)
+
+  const image = Buffer.from(value.imageBase64, 'base64')
+  assert.equal(value.bytes, image.length)
+  assert.equal(image.subarray(0, 8).toString('hex'), '89504e470d0a1a0a', 'the payload is a real PNG')
+
+  const rendered = tool.output.render({}, value)
+  assert.match(rendered[0].text, /no temporary file is left behind/)
+})
+
+test('take_screenshot burns its temp file even when the capture fails', { skip }, async (t) => {
+  // unknown_action on the bridge + a window title that cannot exist: the local capture fails,
+  // and the finally block still has to leave the temp directory clean.
+  const { byName } = await setup(t, { captureFallback: true })
+  const tool = byName.get('luastg_take_screenshot')
+
+  const before = readdirSync(tmpdir()).filter((name) => name.startsWith('luastg_shot_'))
+  await assert.rejects(
+    tool.execute({ window_title: 'no-such-window-3f9c1a' }, exec()),
+    /luastg_take_screenshot:/,
+  )
+  const after = readdirSync(tmpdir()).filter((name) => name.startsWith('luastg_shot_'))
+  assert.deepEqual(after.sort(), before.sort(), 'no luastg_shot_*.png may survive a failed capture')
+})
+
+test('take_screenshot explains a bridge without the action when the fallback is off', { skip }, async (t) => {
+  const { byName } = await setup(t, { captureFallback: false })
+  const tool = byName.get('luastg_take_screenshot')
+
+  await assert.rejects(tool.execute({}, exec()), /no take_screenshot action and captureFallback is disabled/)
+})
+test('take_screenshot keeps the PNG on disk when keep_file is set', { skip }, async (t) => {
+  const { byName } = await setup(t, {}, { screenshot: true })
+  const tool = byName.get('luastg_take_screenshot')
+
+  const value = await tool.execute({ keep_file: true }, exec())
+  t.after(() => rmSync(value.path, { force: true }))
+
+  assert.equal(value.temporaryFileDeleted, false)
+  assert.equal(value.kept, true)
+  assert.ok(value.path.startsWith(tmpdir()), 'kept files stay in the system temp directory')
+  assert.equal(statSync(value.path).size, value.bytes)
+  assert.equal(existsSync(value.path), true)
 })

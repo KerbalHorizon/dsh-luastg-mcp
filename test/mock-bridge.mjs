@@ -151,7 +151,7 @@ function refreshText(value) {
     if (time) value.text = `wait ${time.value}`
     return
   }
-  if (value.type === 'Stage' || value.type === 'StageGroup' || value.type === 'RootFolder') {
+  if (value.type === 'Stage' || value.type === 'StageGroup' || value.type === 'RootFolder' || value.type === 'Folder') {
     const name = findAttribute(value, 'Name')
     if (name) value.text = name.value
   }
@@ -171,17 +171,20 @@ function getTree(request, document) {
   }
 }
 
-function insertNode(request, document) {
+function insertNode(request, document, options = {}) {
   const requestedType = typeof request.type === 'string' ? request.type.trim() : ''
   if (requestedType === '') return failure('bad_request', "'type' is required, for example \"Comment\"")
   const simpleName = requestedType.includes('.')
     ? requestedType.slice(requestedType.lastIndexOf('.') + 1)
     : requestedType
-  const known = ['Comment', 'TaskWait', 'Folder', 'Stage', 'StageGroup']
+  const known = ['Comment', 'TaskWait', 'Folder', 'Stage', 'StageGroup', 'StageBG']
   if (!known.includes(simpleName)) {
     return failure('unknown_node_type', `unknown node type '${requestedType}'`, {
       suggestions: known.filter((name) => name.toLowerCase().includes(simpleName.toLowerCase())),
     })
+  }
+  if (Array.isArray(options.rejectTypes) && options.rejectTypes.includes(simpleName)) {
+    return failure('insert_failed', `the editor rejected the insert of '${simpleName}'`)
   }
 
   const requestedParent = typeof request.parent === 'string' && request.parent.trim() !== '' ? request.parent.trim() : '0'
@@ -293,19 +296,81 @@ function deleteNode(request, document) {
   }
 }
 
-function handleRequest(request, document) {
+function applySubtree(request, document, options = {}) {
+  const tree = request.tree
+  if (!tree || typeof tree !== 'object' || Array.isArray(tree)) {
+    return failure('bad_request', "'tree' is required, for example {\"type\":\"Comment\"}")
+  }
+
+  const requestedType = typeof tree.type === 'string' ? tree.type.trim() : ''
+  if (requestedType === '') return failure('bad_request', 'every tree node needs a "type"')
+
+  const parent = typeof request.parent === 'string' && request.parent.trim() !== '' ? request.parent.trim() : '0'
+  const first = insertNode({ type: tree.type, parent, attributes: tree.attributes }, document, options)
+  if (first.status !== 'ok') return first
+
+  const visit = (spec, parentPath) => {
+    for (const child of spec.children ?? []) {
+      const created = insertNode(
+        { type: child.type, parent: parentPath, attributes: child.attributes },
+        document,
+        options,
+      )
+      if (created.status !== 'ok') return created
+      const nested = visit(child, created.path)
+      if (nested !== null) return nested
+    }
+    return null
+  }
+
+  const nestedFailure = visit(tree, first.path)
+  if (nestedFailure !== null) return nestedFailure
+
+  return {
+    status: 'ok',
+    created: countNodes(tree),
+    path: first.path,
+    text: first.text,
+    parentPath: parent,
+    nodeCount: countNodes(document.root),
+  }
+}
+
+/** 1x1 transparent PNG, enough for the screenshot tool to write a real file. */
+const TINY_PNG_BASE64 =
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+
+function handleRequest(request, document, options = {}) {
   if (document === null) return failure('no_document', 'no document is open')
   switch (request.action) {
     case 'ping':
       return { status: 'pong', editor: 'connected' }
+    case 'take_screenshot':
+      // Like apply_subtree, this is a newer bridge action: opt in per test.
+      return options.screenshot === true
+        ? {
+            status: 'ok',
+            format: 'png',
+            width: 1,
+            height: 1,
+            window: 'Mock Editor',
+            imageBase64: TINY_PNG_BASE64,
+          }
+        : failure('unknown_action', `unknown action '${request.action}'`)
     case 'get_tree':
       return getTree(request, document)
     case 'insert_node':
-      return insertNode(request, document)
+      return insertNode(request, document, options)
     case 'set_attribute':
       return setAttribute(request, document)
     case 'delete_node':
       return deleteNode(request, document)
+    case 'apply_subtree':
+      // The documented protocol v1 has no such action; opt in only when a test
+      // wants to exercise the bulk path.
+      return options.applySubtree === true
+        ? applySubtree(request, document, options)
+        : failure('unknown_action', `unknown action '${request.action}'`)
     default:
       return failure('unknown_action', `unknown action '${request.action}'`)
   }
@@ -346,7 +411,7 @@ export async function startMockBridge(options = {}) {
             continue
           }
           requests.push(request)
-          socket.write(`${JSON.stringify(handleRequest(request, document))}\n`)
+          socket.write(`${JSON.stringify(handleRequest(request, document, options))}\n`)
         }
 
         newline = buffer.indexOf('\n')
