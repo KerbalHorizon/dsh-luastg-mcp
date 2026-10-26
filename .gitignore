@@ -36,3 +36,6 @@ docs/thlib-sprites/
 docs/luastgaex+_doc/
 docs/_api_index.md
 docs/_raw_api_temp.md
+
+# 案例库的黄金参考答案要入库（其余分析产物仍忽略）
+!docs/cases/analysis_*.json
