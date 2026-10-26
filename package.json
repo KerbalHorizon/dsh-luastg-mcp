@@ -11,6 +11,8 @@
   "files": [
     "lib/",
     "scripts/",
+    "csharp/",
+    "docs/sprite-index.json",
     "cordis.patch.yml",
     "README.md",
     "package.json"
