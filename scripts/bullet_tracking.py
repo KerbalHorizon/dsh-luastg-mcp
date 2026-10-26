@@ -163,60 +163,142 @@ def _ray_convergence(points: np.ndarray, directions: np.ndarray) -> tuple[np.nda
     return point, float(np.sqrt(np.mean(residuals**2)))
 
 
-def classify_pattern(bullets: list[dict], min_bullets: int = 8) -> dict:
+def _classify_core(points: np.ndarray, units: np.ndarray, angles: list[float]) -> dict:
+    """Classification of one (sub)set of bullets; the single source of truth."""
+    samples = len(angles)
+    if samples < 4:
+        return {"kind": "too_few", "confidence": 0.0, "samples": samples}
+
+    spread = _circular_std(angles)
+
+    # Spiral: the velocity is mostly tangential to the centre, the signature of a rotating arm.
+    center = points.mean(axis=0)
+    offsets = points - center
+    radius = np.linalg.norm(offsets, axis=1)
+    radial = offsets / np.maximum(radius[:, None], 1e-6)
+    tangent = np.stack([-radial[:, 1], radial[:, 0]], axis=1)
+    radial_align = float(np.mean(np.sum(units * radial, axis=1)))
+    tangent_align = float(np.mean(np.sum(units * tangent, axis=1)))
+
+    if abs(radial_align) < 0.35 and abs(tangent_align) >= 0.55 and spread >= 45.0:
+        return {
+            "kind": "spiral",
+            "confidence": round(abs(tangent_align), 2),
+            "center": [round(float(center[0]), 1), round(float(center[1]), 1)],
+            "spin": "counter-clockwise" if tangent_align > 0 else "clockwise",
+            "spreadDeg": round(spread, 1),
+            "samples": samples,
+        }
+
+    if spread <= 10.0:
+        return {"kind": "parallel", "confidence": round(1.0 - spread / 10.0, 2), "spreadDeg": round(spread, 1), "samples": samples}
+
+    # Ring before convergence: a symmetric ring's rays all pass through its centre, so it would
+    # otherwise look like a 360° fan. Positions on a circle are what separates the two.
+    if radius.mean() > 1 and radius.std() / max(radius.mean(), 1e-6) <= 0.3:
+        coverage = _angular_coverage(offsets)
+        if abs(radial_align) >= 0.55 and coverage >= 200.0:
+            return {
+                "kind": "ring",
+                "confidence": round(abs(radial_align), 2),
+                "center": [round(float(center[0]), 1), round(float(center[1]), 1)],
+                "radius": round(float(radius.mean()), 1),
+                "coverageDeg": round(coverage, 1),
+                "direction": "outward" if radial_align > 0 else "inward",
+                "samples": samples,
+            }
+
+    # Any pattern fired from one muzzle or aimed at one target has converging lines.
+    point, rms = _ray_convergence(points, units)
+    if point is not None and rms <= 60.0:
+        ahead = float(np.mean(np.sum(units * (point - points), axis=1)))
+        return {
+            "kind": "aimed" if ahead > 0 else "fan_spread",
+            "confidence": round(max(0.0, min(1.0, 1.0 - rms / 60.0)), 2),
+            "spreadDeg": round(spread, 1),
+            "center": [round(float(point[0]), 1), round(float(point[1]), 1)],
+            "residualPx": round(rms, 1),
+            "samples": samples,
+        }
+
+    return {"kind": "chaos", "confidence": 0.0, "spreadDeg": round(spread, 1), "samples": samples}
+
+
+def _spatial_clusters(points: np.ndarray, k: int, iterations: int = 12) -> np.ndarray:
+    """Tiny k-means (no sklearn) so a mixed screen can be classified region by region."""
+    k = min(k, len(points))
+    if k <= 1:
+        return np.zeros(len(points), dtype=int)
+    # Deterministic seeding: farthest-point sampling, which spreads the centroids.
+    centroids = [points[0]]
+    for _ in range(k - 1):
+        distances = np.min(np.linalg.norm(points[:, None, :] - np.array(centroids)[None, :, :], axis=2), axis=1)
+        centroids.append(points[int(np.argmax(distances))])
+    centres = np.array(centroids, dtype=np.float64)
+
+    labels = np.zeros(len(points), dtype=int)
+    for _ in range(iterations):
+        distances = np.linalg.norm(points[:, None, :] - centres[None, :, :], axis=2)
+        labels = np.argmin(distances, axis=1)
+        for index in range(len(centres)):
+            members = points[labels == index]
+            if len(members):
+                centres[index] = members.mean(axis=0)
+    return labels
+
+
+def classify_pattern(bullets: list[dict], min_bullets: int = 8, cluster: bool = True) -> dict:
     """Classifies the velocity field of one frame.
 
-    `bullets` items need x, y, vx, vy; returns {kind, confidence, ...diagnostics}.
+    A dense screen mixes several patterns (a ring near the boss, a aimed volley at the player).
+    The global pass therefore runs first, and only when it degenerates into `chaos` does the
+    classifier split the screen into up to four spatial clusters and report the dominant coherent
+    one, with every cluster listed under `clusters`.
+
+    `bullets` items need x, y, vx, vy; returns {kind, confidence, source, ...diagnostics}.
     """
     moving = [b for b in bullets if abs(b["vx"]) > 1e-6 or abs(b["vy"]) > 1e-6]
     if len(moving) < min_bullets:
-        return {"kind": "too_few", "confidence": 0.0, "samples": len(moving)}
+        return {"kind": "too_few", "confidence": 0.0, "samples": len(moving), "source": "global"}
 
     points = np.array([[b["x"], b["y"]] for b in moving], dtype=np.float64)
     units = np.array([_unit(b["vx"], b["vy"]) for b in moving], dtype=np.float64)
     angles = [math.degrees(math.atan2(b["vy"], b["vx"])) % 360.0 for b in moving]
 
-    spread = _circular_std(angles)
-    if spread <= 10.0:
-        return {"kind": "parallel", "confidence": round(1.0 - spread / 10.0, 2), "spreadDeg": round(spread, 1), "samples": len(moving)}
+    core = _classify_core(points, units, angles)
+    core["source"] = "global"
+    if core["kind"] != "chaos" or not cluster or len(moving) < min_bullets * 3:
+        return core
 
-    # Ring before convergence: a symmetric ring's rays all pass through its centre, so it would
-    # otherwise look like a 360° fan. The position spread is what separates the two.
-    center = points.mean(axis=0)
-    radius = np.linalg.norm(points - center, axis=1)
-    if radius.mean() > 1 and radius.std() / radius.mean() <= 0.25:
-        outward = points - center
-        outward /= np.maximum(np.linalg.norm(outward, axis=1, keepdims=True), 1e-6)
-        alignment = float(np.mean(np.sum(units * outward, axis=1)))
-        coverage = _angular_coverage(points - center)
-        if abs(alignment) >= 0.65 and coverage >= 240.0:
-            return {
-                "kind": "ring",
-                "confidence": round(abs(alignment), 2),
-                "center": [round(float(center[0]), 1), round(float(center[1]), 1)],
-                "radius": round(float(radius.mean()), 1),
-                "coverageDeg": round(coverage, 1),
-                "direction": "outward" if alignment > 0 else "inward",
-                "samples": len(moving),
-            }
+    # Local pass: a mixed frame is often coherent inside each region.
+    labels = _spatial_clusters(points, 4)
+    clusters: list[dict] = []
+    for index in range(int(labels.max()) + 1):
+        members = np.flatnonzero(labels == index)
+        if len(members) < min_bullets:
+            continue
+        result = _classify_core(points[members], units[members], [angles[i] for i in members])
+        result["cluster"] = index
+        result["centroid"] = [round(float(points[members, 0].mean()), 1), round(float(points[members, 1].mean()), 1)]
+        clusters.append(result)
 
-    # Any pattern that is fired from one muzzle or aimed at one target has converging lines.
-    point, rms = _ray_convergence(points, units)
-    if point is not None and rms <= 45.0:
-        ahead = float(np.mean(np.sum(units * (point - points), axis=1)))
-        confidence = round(max(0.0, min(1.0, 1.0 - rms / 45.0)), 2)
-        kind = "aimed" if ahead > 0 else "fan_spread"
-        return {
-            "kind": kind,
-            "confidence": confidence,
-            "spreadDeg": round(spread, 1),
-            "center": [round(float(point[0]), 1), round(float(point[1]), 1)],
-            "residualPx": round(rms, 1),
-            "samples": len(moving),
-        }
+    # Quality gate: a converging point fitted to 8 noisy bullets is not evidence.
+    coherent = [
+        item
+        for item in clusters
+        if item["kind"] not in ("chaos", "too_few") and item["confidence"] >= 0.3 and item["samples"] >= 10
+    ]
+    if not coherent:
+        core["clusters"] = clusters
+        return core
 
-    return {"kind": "chaos", "confidence": 0.0, "spreadDeg": round(spread, 1), "samples": len(moving)}
-
+    best = max(coherent, key=lambda item: item["samples"] * max(item["confidence"], 0.2))
+    return {
+        **best,
+        "source": "cluster",
+        "confidence": round(min(1.0, best["confidence"] * 0.9), 2),
+        "clusters": clusters,
+    }
 
 def _angular_coverage(offsets: np.ndarray) -> float:
     """How much of the circle the positions cover (360 - the largest empty gap)."""
