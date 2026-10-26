@@ -101,14 +101,35 @@ def extract_frames(ffmpeg: str, video: str, prefix: str, interval: float, start:
         sys.exit("error: ffmpeg failed: " + (lines[-1] if lines else f"exit {result.returncode}"))
 
 
-def analyse(video: str, frames: list[str], interval: float, start: float) -> list[dict]:
+def load_tracking():
+    """Imports bullet_tracking.py from this folder."""
+    path = os.path.join(HERE, "bullet_tracking.py")
+    spec = importlib.util.spec_from_file_location("bullet_tracking", path)
+    if spec is None or spec.loader is None:
+        sys.exit(f"error: cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def analyse(video: str, frames: list[str], interval: float, start: float, options: dict | None = None) -> list[dict]:
+    options = options or {}
     counter = load_counter()
+    tracker_module = load_tracking() if options.get("tracks") else None
+    tracker = (
+        tracker_module.Tracker(max_speed=options.get("max_speed", 1400.0), max_misses=0)
+        if tracker_module is not None
+        else None
+    )
     timeline: list[dict] = []
 
     # The playfield is fixed for a whole video: detect it once on the first frame and reuse the
     # crop, otherwise the counts jitter every time the detector picks a different band.
     first = counter.load_rgb(frames[0])
-    (left, top, right, bottom), crop_report = counter.auto_crop(first)
+    if options.get("crop"):
+        (left, top, right, bottom), crop_report = counter.parse_crop(options["crop"], first.width, first.height), {"reason": "explicit crop"}
+    else:
+        (left, top, right, bottom), crop_report = counter.auto_crop(first)
     fixed_crop = f"{left},{top},{right - left},{bottom - top}"
     print(
         f"playfield: {fixed_crop} ({crop_report.get('reason', 'auto')})",
@@ -116,7 +137,15 @@ def analyse(video: str, frames: list[str], interval: float, start: float) -> lis
     )
 
     for index, frame in enumerate(frames):
-        result = counter.analyze_path(frame, auto=True, crop=fixed_crop, limit=0)
+        result = counter.analyze_path(
+            frame,
+            auto=True,
+            crop=fixed_crop,
+            limit=4000 if tracker is not None else 0,
+            template=bool(options.get("template")),
+            template_category=options.get("template_category", "bullet"),
+            template_max_score=options.get("template_max_score", 1.8),
+        )
         entry = {
             "time": round(start + index * interval, 3),
             "frame": index,
@@ -137,6 +166,33 @@ def analyse(video: str, frames: list[str], interval: float, start: float) -> lis
             entry["spawn_rate"] = 0.0
             entry["spawn_rate_positive"] = 0.0
 
+        if tracker is not None:
+            detections = [
+                {
+                    "x": component["cx"],
+                    "y": component["cy"],
+                    "sprite": component.get("sprite"),
+                    "area": component["area"],
+                }
+                for component in result["components"]
+                if options.get("min_area", 0) <= component["area"] <= options.get("max_area", 10**9)
+            ]
+            tracker.update(detections, index, interval)
+            confirmed = tracker.confirmed(index)
+            entry["tracks"] = tracker_module.summarize_tracks(confirmed, interval)
+            entry["bullets"] = [
+                {
+                    "sprite_name": track.sprite,
+                    "x": round(track.x, 1),
+                    "y": round(track.y, 1),
+                    "vx": round(track.vx, 1),
+                    "vy": round(track.vy, 1),
+                    "track": track.id,
+                }
+                for track in confirmed[: options.get("max_bullets", 150)]
+            ]
+            entry["pattern"] = tracker_module.classify_pattern(entry["bullets"])
+
         timeline.append(entry)
 
     return timeline
@@ -153,6 +209,17 @@ def main() -> int:
     parser.add_argument("--out", default="analysis_result.json", help="where to write the timeline JSON")
     parser.add_argument("--keep-frames", action="store_true", help="do not delete the extracted PNGs")
     parser.add_argument("--quiet", action="store_true", help="only write the file, no progress output")
+    parser.add_argument(
+        "--tracks",
+        action="store_true",
+        help="track every bullet between frames: adds sprite_name/x/y/vx/vy, track ids and the pattern",
+    )
+    parser.add_argument("--crop", default="", help="fixed playfield crop left,top,width,height (skips auto detection)")
+    parser.add_argument("--track-min-area", type=int, default=18, help="ignore blobs smaller than this when tracking")
+    parser.add_argument("--track-max-area", type=int, default=4000, help="ignore blobs larger than this when tracking")
+    parser.add_argument("--track-max-speed", type=float, default=1400.0, help="match gate in px/s")
+    parser.add_argument("--max-bullets", type=int, default=150, help="bullets listed per frame in the JSON")
+    parser.add_argument("--no-template", action="store_true", help="with --tracks, skip sprite naming")
     args = parser.parse_args()
 
     if not os.path.isfile(args.video):
@@ -180,7 +247,23 @@ def main() -> int:
             print("error: ffmpeg produced no frame (wrong interval or unreadable video)", file=sys.stderr)
             return 3
 
-        timeline = analyse(args.video, frames, args.interval, args.start)
+        timeline = analyse(
+            args.video,
+            frames,
+            args.interval,
+            args.start,
+            {
+                "tracks": args.tracks,
+                "crop": args.crop,
+                "template": args.tracks and not args.no_template,
+                "template_category": "bullet",
+                "template_max_score": 1.8,
+                "min_area": args.track_min_area,
+                "max_area": args.track_max_area,
+                "max_speed": args.track_max_speed,
+                "max_bullets": args.max_bullets,
+            },
+        )
 
         with open(args.out, "w", encoding="utf-8") as handle:
             json.dump(timeline, handle, ensure_ascii=False, indent=2)
@@ -199,6 +282,15 @@ def main() -> int:
             if rates:
                 print(f"spawn rate: avg {sum(rates) / len(rates):.1f}/s, max {max(rates):.1f}/s, "
                       f"total {time.time() - started:.1f}s wall clock")
+            if args.tracks:
+                kinds = [item["pattern"]["kind"] for item in timeline if "pattern" in item]
+                top = max(set(kinds), key=kinds.count) if kinds else "none"
+                speeds = [item["tracks"]["speedMean"] for item in timeline if item.get("tracks", {}).get("tracks")]
+                print(
+                    f"patterns: {', '.join(f'{k} x{v}' for k, v in sorted(((k, kinds.count(k)) for k in set(kinds)), key=lambda kv: -kv[1]))}"
+                )
+                if speeds:
+                    print(f"bullet speed: mean {sum(speeds)/len(speeds):.0f} px/s, dominant pattern {top}")
     finally:
         if args.keep_frames:
             print(f"frames kept: {prefix}_*.png", file=sys.stderr)
