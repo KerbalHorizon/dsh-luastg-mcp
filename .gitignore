@@ -39,3 +39,6 @@ docs/_raw_api_temp.md
 
 # 案例库的黄金参考答案要入库（其余分析产物仍忽略）
 !docs/cases/analysis_*.json
+
+# 编辑器工作副本（案例库已在 docs/cases 中归档）
+References/

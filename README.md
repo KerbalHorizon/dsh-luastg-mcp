@@ -1,8 +1,13 @@
 # dsh-luastg-mcp
 
-**v1.0.0** · 5 个核心工具 · TCP NDJSON 传输 · 需要 DSH `0.2.0-rc.2`、Node `>= 22.13`
+**v1.1.0** · 7 个核心工具 · TCP NDJSON 传输 · 需要 DSH `0.2.0-rc.2`、Node `>= 22.13`
 
 [![CI](https://github.com/KerbalHorizon/dsh-luastg-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/KerbalHorizon/dsh-luastg-mcp/actions/workflows/ci.yml)
+[![Case Study](https://img.shields.io/badge/%F0%9F%93%9A-Video--to--Code%20Case%2001-8a2be2)](docs/cases/case-study.md)
+
+📚 **Includes Video-to-Code Case Study (Case 01)** — 一段实机录像 → 视频分析 → 节点树复刻 →
+F5 观感对齐的完整复盘，含 10 项差异对照与 `LocalVar` 作用域 Bug 全记录：
+[docs/cases/case-study.md](docs/cases/case-study.md)
 
 DSH（DeepSeek Harness）插件：通过 TCP 连接 **LuaSTG Editor Sharp X** 进程内的
 `LuaSTGMcpBridge`，把编辑器**当前打开**的 `.lstges` 工程节点树暴露给模型，并让模型
@@ -28,6 +33,7 @@ DSH（DeepSeek Harness）插件：通过 TCP 连接 **LuaSTG Editor Sharp X** �
 - [10. v1.0.0 验收记录](#10-v100-验收记录)
 - [11. 视频逆向解析 (Video-to-Danmaku)](#11-视频逆向解析-video-to-danmaku)
 - [12. 版本与兼容](#12-版本与兼容)
+- [案例库：视频逆向 Case 01](docs/cases/case-study.md)
 
 ---
 
