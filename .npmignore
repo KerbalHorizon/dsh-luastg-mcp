@@ -1,0 +1,11 @@
+# npm publish allowlist lives in package.json ("files"); this file only prunes the
+# generated leftovers that would otherwise ride along inside the listed folders.
+
+# Python bytecode from running the analysis scripts
+scripts/__pycache__/
+**/__pycache__/
+*.pyc
+
+# local caches / scratch
+.tmp-npm-cache/
+*.tgz

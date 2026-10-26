@@ -9,12 +9,11 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "lib",
+    "lib/",
+    "scripts/",
     "cordis.patch.yml",
-    "docs",
-    "scripts/capture-window.ps1",
-    "csharp",
-    "README.md"
+    "README.md",
+    "package.json"
   ],
   "keywords": [
     "dsh-plugin",
