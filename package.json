@@ -1,6 +1,6 @@
 {
   "name": "dsh-luastg-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "DSH plugin bridging to the LuaSTG Editor Sharp X MCP bridge over TCP: live node-tree reads, path-based attribute and Code-script updates, node insertion and subtree deletion through real editor commands",
   "type": "module",
   "main": "lib/index.js",

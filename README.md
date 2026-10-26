@@ -26,7 +26,8 @@ DSH（DeepSeek Harness）插件：通过 TCP 连接 **LuaSTG Editor Sharp X** �
 - [8. 开发与测试](#8-开发与测试)
 - [9. 安全边界与已知限制](#9-安全边界与已知限制)
 - [10. v1.0.0 验收记录](#10-v100-验收记录)
-- [11. 版本与兼容](#11-版本与兼容)
+- [11. 视频逆向解析 (Video-to-Danmaku)](#11-视频逆向解析-video-to-danmaku)
+- [12. 版本与兼容](#12-版本与兼容)
 
 ---
 
@@ -646,7 +647,89 @@ powershell -NoProfile -ExecutionPolicy Bypass -File `
 
 ---
 
-## 11. 版本与兼容
+## 11. 视频逆向解析 (Video-to-Danmaku)
+
+从一段游戏录像反推出弹幕结构：抽帧 → 数弹 → 跟踪 → 阵型归类，最后给出可直接映射成
+节点树的参数（弹数、颜色、速度 px/s、旋转方向）。**这一段与 MCP 桥接无关**，只依赖
+Python、Pillow/numpy 和 ffmpeg。
+
+### 11.1 依赖
+
+| 依赖 | 说明 |
+|---|---|
+| Python `>= 3.10` | 脚本只用到标准库 + 下面两个包 |
+| `Pillow`、`numpy` | `count-bullets.py` 首次运行会**自动 `pip install`**；设 `DSH_NO_AUTO_INSTALL=1` 可禁止 |
+| `ffmpeg` | 抽帧用；需在 `PATH`，或用 `--ffmpeg=C:\path\ffmpeg.exe`，或设 `FFMPEG_PATH` |
+
+> **不需要 OpenCV**：连通域标注是 `scripts/count-bullets.py` 里自带的并查集，模板匹配用
+> 的是边缘签名，纯 numpy 实现，避免在离线环境里装 `opencv-python`。
+
+### 11.2 四个脚本
+
+| 脚本 | 作用 |
+|---|---|
+| `scripts/slice-sprites.py` | 按 THlib 的 Lua 元数据（`LoadImage` / `LoadImageGroup`）把图集切成单图，产出 `docs/sprite-index.json` |
+| `scripts/count-bullets.py` | 单帧计数：阈值 + 连通域 + 颜色分类；`--auto` 自动裁战斗区自适应阈值；`--template` 按 `docs/sprites_sliced` 命名每一发 |
+| `scripts/bullet_tracking.py` | 帧间互选最近邻跟踪，逐发给出 `vx, vy`（px/s）；阵型分类 `parallel / ring / aimed / fan_spread / spiral / chaos` |
+| `scripts/analyze-video-bullets.py` | 串起全流程：ffmpeg 抽帧 → 逐帧计数 → 跟踪 → 写时间轴 JSON |
+
+辅助：`scripts/extract-video-frames.mjs` 只做抽帧（场景变化或定帧率），适合先看素材。
+
+### 11.3 用法
+
+```bash
+# 1) 切图集（模板匹配与精灵命名的前提）
+python scripts/slice-sprites.py
+
+# 2) 单张截图：计数 + 颜色分布
+python scripts/count-bullets.py shots/danmaku.png --auto
+python scripts/count-bullets.py shots/danmaku.png --auto --template --limit=20
+
+# 3) 视频：每 0.5 秒抽一帧，输出时间轴
+python scripts/analyze-video-bullets.py game.mp4 --interval 0.5 --out analysis_result.json
+
+# 4) 视频 + 跟踪 + 阵型（密集弹幕建议 0.05~0.1 s）
+python scripts/analyze-video-bullets.py game.mp4 --tracks --interval 0.1 --out analysis_result.json
+```
+
+`--tracks` 会在每帧追加：
+
+```json
+{
+  "time": 0.5,
+  "total_bullets": 220,
+  "colors": {"blue": 171, "magenta": 38},
+  "pattern": {"kind": "fan_spread", "confidence": 0.91, "center": [320.0, 100.0], "samples": 148},
+  "tracks": {"tracks": 206, "speedMean": 244.0, "speedMax": 512.0, "lifetimeMean": 0.8},
+  "bullets": [{"sprite_name": "ball_mid3", "x": 312.4, "y": 180.2, "vx": 41.2, "vy": 88.3, "track": 17}]
+}
+```
+
+### 11.4 阵型判定
+
+| `kind` | 判据 |
+|---|---|
+| `parallel` | 速度方向圆标准差 ≤ 10°（弹幕墙、直线流） |
+| `ring` | 位置落在圆上（半径 std/mean ≤ 0.3）+ 速度径向对齐 ≥ 0.55 + 角度覆盖 ≥ 200° |
+| `spiral` | 速度以切向为主（径向对齐 < 0.35、切向 ≥ 0.55） |
+| `aimed` | 所有射线汇聚在**前方**一点（瞄准玩家） |
+| `fan_spread` | 射线汇聚在**后方**一点（同一炮口、多角度） |
+| `chaos` | 都不满足，或跟踪不稳（`lifetimeMean` 很低时通常就是它） |
+
+密集画面先跑全局判定，退化成 `chaos` 时再切成最多 4 个空间簇分别判定，取最可信的一簇
+（`source: "cluster"`）；簇结果必须置信度 ≥ 0.3、样本 ≥ 10，否则不采纳。
+
+### 11.5 已知局限
+
+- **跟踪依赖采样率**：0.5 s 间隔下高速弹会串号，密集场景请用 0.05–0.1 s。
+- **检测层会被特效骗**：静止激光、爆炸、UI 文字都会被当成弹；用 `--crop` 锁死战斗区、
+  `--no-white` 去掉白色豁免。
+- **速度只能定性**：单帧无法区分“新生成/飞出/被消弹”，`spawn_rate` 是净变化率。
+- 像素计数对重叠弹会少算，`estimatedBullets` 只是按中位面积拆分的启发值。
+
+---
+
+## 12. 版本与兼容
 
 ### 相对 v0.5.0 的变化
 
