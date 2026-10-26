@@ -422,6 +422,102 @@ def auto_thresholds(crop: Image.Image) -> tuple[int, int, list[str], dict]:
     }
 
 
+# --------------------------------------------------------------------------- template matching
+
+SPRITE_INDEX = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "sprite-index.json")
+
+
+def load_templates(index_path: str, category: str, size: int = 16) -> list[dict]:
+    """Loads the sliced sprites (docs/sprites_sliced) as a matching bank.
+
+    Every template is resized to `size`×`size` and premultiplied by its alpha, so sprites of
+    different original sizes compare structurally.
+    """
+    if not os.path.isfile(index_path):
+        print(
+            f"warning: {index_path} is missing; run scripts/slice-sprites.py first. Template matching is off.",
+            file=sys.stderr,
+        )
+        return []
+
+    with open(index_path, encoding="utf-8") as handle:
+        entries = json.load(handle)
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(index_path)))
+    bank: list[dict] = []
+    for entry in entries:
+        if category != "all" and entry.get("category") != category:
+            continue
+        path = os.path.join(root, entry["file"])
+        if not os.path.isfile(path):
+            continue
+        try:
+            sprite = Image.open(path).convert("RGBA")
+        except OSError:
+            continue
+        thumb = sprite.resize((size, size), Image.BILINEAR)
+        array = np.asarray(thumb, dtype=np.float32)
+        alpha = array[:, :, 3:4] / 255.0
+        bank.append({"name": entry["name"], "w": entry["w"], "h": entry["h"], "array": edge_signature(array[:, :, :3] * alpha)})
+    return bank
+
+
+def edge_signature(rgb: np.ndarray) -> np.ndarray:
+    """Contrast-normalised edge map of a small thumbnail.
+
+    Matching on edges instead of raw pixels is what makes a white-cored bullet with a cyan rim
+    comparable to the same sprite drawn on a bright HUD-free background: brightness and colour
+    cancel out, the silhouette stays.
+    """
+    grey = rgb.mean(axis=2)
+    edges = np.zeros_like(grey)
+    edges[:, :-1] += np.abs(np.diff(grey, axis=1))
+    edges[:-1, :] += np.abs(np.diff(grey, axis=0))
+    edges -= edges.mean()
+    return edges / (edges.std() + 1e-6)
+
+
+def match_templates(signature: np.ndarray, stack: np.ndarray, names: list[str]) -> tuple[str | None, float]:
+    """Returns the closest template name and its mean squared edge difference (0 = identical)."""
+    if stack.size == 0:
+        return None, 99.0
+    scores = ((stack - signature[None, :, :]) ** 2).mean(axis=(1, 2))
+    best = int(np.argmin(scores))
+    return names[best], float(scores[best])
+
+
+def apply_templates(
+    region: Image.Image,
+    components: list[dict],
+    index_path: str,
+    category: str,
+    max_score: float,
+    size: int = 16,
+) -> dict[str, int]:
+    """Annotates every component with its best sprite match and counts the matches by sprite."""
+    bank = load_templates(index_path, category, size)
+    if not bank:
+        return {}
+
+    stack = np.stack([item["array"] for item in bank])
+    names = [item["name"] for item in bank]
+    array = np.asarray(region.convert("RGBA"), dtype=np.uint8)
+
+    counts: dict[str, int] = {}
+    for component in components:
+        x, y, width, height = component["bbox"]
+        patch = Image.fromarray(array[y : y + height, x : x + width])
+        thumb = patch.resize((size, size), Image.BILINEAR)
+        data = np.asarray(thumb, dtype=np.float32)
+        name, score = match_templates(edge_signature(data[:, :, :3]), stack, names)
+        component["sprite"] = name
+        component["spriteScore"] = round(score, 2)
+        if name is not None and score <= max_score:
+            counts[name] = counts.get(name, 0) + 1
+
+    return dict(sorted(counts.items(), key=lambda item: -item[1]))
+
+
 def analyze_path(
     image_path: str,
     *,
@@ -434,6 +530,10 @@ def analyze_path(
     no_white: bool = False,
     limit: int = 0,
     annotate_path: str | None = None,
+    template: bool = False,
+    template_index: str = SPRITE_INDEX,
+    template_category: str = "bullet",
+    template_max_score: float = 1.8,
 ) -> dict:
     """Counts the bullets of one image and returns the JSON-ready result.
 
@@ -510,6 +610,11 @@ def analyze_path(
         "estimatedBullets": estimated,
         "mergedBlobs": merged,
         "byColor": dict(sorted(by_color.items(), key=lambda item: -item[1])),
+        "sprites": (
+            apply_templates(region, components, template_index, template_category, template_max_score)
+            if template
+            else {}
+        ),
         "components": components[:limit],
         "annotated": annotated,
         "elapsedMs": int((time.time() - started) * 1000),
@@ -538,6 +643,14 @@ def main() -> int:
         default=None,
         help="write a PNG with every kept blob boxed; default path is under the temp directory",
     )
+    parser.add_argument(
+        "--template",
+        action="store_true",
+        help="match every blob against docs/sprites_sliced (run scripts/slice-sprites.py first)",
+    )
+    parser.add_argument("--template-index", default=SPRITE_INDEX, help="sprite index JSON")
+    parser.add_argument("--template-category", default="bullet", help="bullet / enemy / item / laser / misc / all")
+    parser.add_argument("--template-max-score", type=float, default=1.8, help="worst accepted edge-MSE for a name")
     parser.add_argument("--json-only", action="store_true", help="print the JSON without the summary line")
     args = parser.parse_args()
 
@@ -556,6 +669,10 @@ def main() -> int:
         no_white=args.no_white,
         limit=args.limit,
         annotate_path=args.annotate,
+        template=args.template,
+        template_index=args.template_index,
+        template_category=args.template_category,
+        template_max_score=args.template_max_score,
     )
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
